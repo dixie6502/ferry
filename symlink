@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -e
+DIR=$(cd "$(dirname "$0")" && pwd)
+mkdir -p "$HOME/bin"
+
+echo "linking ferry"
+ln -sf "$DIR/ferry"           "$HOME/bin/ferry"
+ln -sf "$DIR/ferry-prompt.sh" "$HOME/.ferry-prompt.sh"
+ls -l "$HOME/bin/ferry" "$HOME/.ferry-prompt.sh"
