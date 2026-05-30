@@ -391,7 +391,7 @@ cmd_rm() {
     local target; target=$(resolve_target "$arg")
     refuse_cwd_inside "$target"
     local rp spec; rp=$(remote_of "$target"); spec=$(spec_of "$target")
-    confirm "$yes" "DELETE BOTH local and cloud for '$spec'? (Filen trash is the backstop)"
+    confirm "$yes" "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"
     remote_exists "$rp" && rclone purge "$rp"
     [ -e "$target" ] && rm -rf "$target"
     rm -rf "$(state_path "$spec")"

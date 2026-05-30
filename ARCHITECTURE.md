@@ -22,8 +22,8 @@ drop it again — alongside a few projects under active editing.
 
 | Component | Role |
 |---|---|
-| **Filen** | Single backend. E2E-encrypted cloud with file version history + trash. |
-| **rclone** | The only transfer tool. Native `filen:` backend (v1.73+). Stateless, on-demand, single binary. No background daemon. Holds the `FilenRemote` remote and its credentials in its own config (`rclone config`). |
+| **Cloud remote** | Any rclone-supported backend. Ideally one with file version history + trash, which then serves as the recovery backstop. |
+| **rclone** | The only transfer tool. Stateless, on-demand, single binary. No background daemon. Holds the remote and its credentials in its own config (`rclone config`). |
 | **`ferry`** | Thin shell wrapper over rclone. Markers (`.ferry`) select a sparse local mirror; verbs pull/push units, manage tree structure, and snapshot git history. |
 | **`ferry-prompt.sh`** | Optional sourced shell function (`__ferry_ps1`) drawing a git-prompt-style drift indicator from the per-machine sync state `ferry` records. |
 
@@ -33,7 +33,7 @@ A **partial mirror** of the remote, selected by `.ferry` marker files — a spar
 on-demand checkout. The tree shape is emergent, not fixed at any depth.
 
 ```
-~/Projects/.ferry             root   → contains "FilenRemote:Projects"
+~/Projects/.ferry             root   → contains "Remote:Projects"
   CL03-Initech/              stub   (grouping dir, no marker)
     site/.ferry                unit   ← transfer unit (empty marker)
     audit/.ferry               unit   ← transfer unit
@@ -75,7 +75,7 @@ matches the "something I control" goal: no daemon, no surprise propagation.
 Continuous two-way sync was considered and rejected: it serves active editing
 but handles the dominant dip-in mode clumsily, re-implements selective presence
 on top of a full syncer (off-pattern), and depends on a pre-1.0 daemon. rclone
-is mature, has the native Filen backend, and gives a true drift check
+is mature, supports a wide range of backends, and gives a true drift check
 (`rclone check`) as a `git fetch`/`status` analog.
 
 **Transfers are additive by default** (`rclone copy`): never delete the far
@@ -109,7 +109,7 @@ two delete verbs split on which side they destroy:
 | `ferry stub <name>` | **must** — errors if not | mirror an existing cloud folder as an empty local shell ("browse, then pull") | read-only |
 | `ferry new <name>` | must **not** | create a brand-new folder, both sides | `rclone mkdir` |
 | `ferry drop <dir>` | — | delete **local only** — presence control; cloud retains | untouched |
-| `ferry rm <dir>` | — | delete **both sides** — confirmation-gated, Filen trash is the backstop | `rclone purge` |
+| `ferry rm <dir>` | — | delete **both sides** — confirmation-gated; recovery depends on the remote's trash/versioning | `rclone purge` |
 
 `stub` / `new` / `pull <sub>` are refused inside a unit's subtree — you are
 already in materialized content, there is nothing to fetch or place. `drop` and
@@ -183,15 +183,16 @@ Native to the model: a unit is local **iff** it was pulled. `ferry drop`
 deletes the local copy; the cloud keeps it. Dormant projects are simply never
 pulled — that is the disk-space control, no extra mechanism. `ferry rm` is the
 deliberate exception that also deletes the cloud copy (confirmation-gated, with
-Filen trash as the backstop); it is kept separate from `drop` so retention and
+the remote's trash as the backstop where available); it is kept separate from `drop` so retention and
 presence stay distinct.
 
 ## Versioning
 
-Default change-tracking is **Filen's built-in version history + trash** —
-automatic, zero ceremony, works on prose and large binaries alike. Overwrites
-via `rclone copy` still create server-side versions. It answers "what did this
-look like before?" without any per-project setup.
+Default change-tracking is the **remote's own version history + trash** (when the
+backend provides them) — automatic, zero ceremony, works on prose and large
+binaries alike. Overwrites via `rclone copy` still create server-side versions
+where supported. It answers "what did this look like before?" without any
+per-project setup.
 
 This is distinct from semantic version control (git), which answers "show me the
 deliberate checkpoint where I restructured the argument." Most needs are the
@@ -250,20 +251,18 @@ Edits made since the last push show as uncommitted changes — correct, not a lo
 
 ## Credentials & secrets
 
-The Filen remote is configured **in rclone itself**, via `rclone config`, as a
-remote named `FilenRemote`. rclone authenticates to Filen with `email` +
-`password` + an `api_key` (a full-access account key, exported once via the
-Filen CLI `export-api-key`); rclone stores them in its config file
-(`~/.config/rclone/rclone.conf`) with `password` and `api_key` obscured.
+The remote is configured **in rclone itself**, via `rclone config`, as a named
+remote (e.g. `Remote`). rclone stores the backend's credentials in its config
+file (`~/.config/rclone/rclone.conf`), obscured.
 
 ```sh
-rclone config        # interactive: new remote → name "FilenRemote" → type "filen"
-rclone listremotes   # confirms: FilenRemote:
+rclone config        # interactive: new remote → name it → pick a backend
+rclone listremotes   # confirms: Remote:
 ```
 
 The `ferry` script contains **no credentials and no personal identifiers** — only
-the remote name `FilenRemote:Projects`. All authentication is delegated to
-rclone's own config, so the script can be published as-is.
+the remote name `Remote:Projects`. All authentication is delegated to rclone's
+own config, so the script can be published as-is.
 
 **Notes:**
 
@@ -271,22 +270,22 @@ rclone's own config, so the script can be published as-is.
   reversible and is *not* a security boundary — guard the file with filesystem
   permissions, and optionally an rclone config password
   (`rclone config` → set configuration password) to encrypt the file at rest.
-- The agent machine needs its **own** `rclone config` (its own `FilenRemote`).
+- The agent machine needs its **own** `rclone config` (its own remote).
   Do not copy `rclone.conf` between machines as the sole protection.
-- Changing the Filen account password requires re-running `rclone config` for
-  `FilenRemote` (new password **and** a freshly re-exported `api_key`).
+- Rotating the backend's credentials requires re-running `rclone config` for
+  the remote.
 
 ## Publishing the script
 
 The `ferry` script can live in a public repo: it holds no secrets and no personal
-identifiers — only the remote name `FilenRemote:Projects`. To keep it that way:
+identifiers — only the remote name `Remote:Projects`. To keep it that way:
 
 - Never commit `rclone.conf`; it lives outside this tree, under
   `~/.config/rclone/`.
 - Never commit real project lists or logs containing client names; project data
   lives under `~/Projects`, a separate tree.
 
-Publishing does disclose the toolchain (Filen + rclone) and the remote name —
+Publishing does disclose the toolchain (rclone) and the remote name —
 reconnaissance-level information, not a credential leak.
 
 ## Two-machine agent workflow
@@ -325,7 +324,7 @@ does not use git.
   `pull`/`push` confer unit status. `stub` requires the cloud folder to exist;
   `new` requires it not to.
 - `ferry drop` is local-only; `ferry rm` deletes both sides (confirmation-gated).
-  Filen version history + trash is the recovery backstop.
+  The remote's version history + trash (where available) is the recovery backstop.
 - Per-machine sync state lives in `${XDG_CACHE_HOME:-~/.cache}/ferry`, never in the
   synced tree, keyed by unit path; `push`/`pull` re-baseline it, `status`
   refreshes the cloud bit, `mv` carries it, `drop`/`rm` delete it.

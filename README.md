@@ -1,9 +1,9 @@
 # ferry
 
 On-demand, **sparse** sync of a remote tree to/from local disk via
-[rclone](https://rclone.org) — built for [Filen](https://filen.io) but backend
--agnostic. A single place for in-progress work that lives **outside GitHub** —
-no collaboration, sensitive data, large files welcome, version control optional.
+[rclone](https://rclone.org) — works with any rclone remote. A single place for
+in-progress work that lives **outside GitHub** — no collaboration, sensitive
+data, large files welcome, version control optional.
 
 Nothing runs in the background: every transfer is an explicit command. The local
 tree is a **partial mirror** of the remote — a directory is present only because
@@ -11,7 +11,7 @@ you pulled it. Where things live is decided by `.ferry` **marker files**, not by
 any fixed folder depth.
 
 ```
-~/Projects/.ferry            root   → holds the remote base "FilenRemote:Projects"
+~/Projects/.ferry            root   → holds the remote base "Remote:Projects"
   CL03-Initech/               stub   (a grouping dir — no marker)
     site/.ferry               unit   ← a transfer unit (empty marker)
     audit/.ferry              unit
@@ -29,13 +29,13 @@ never spell out both sides, and a rename recomputes everything beneath it for fr
 
 ## Setup
 
-Requires `bash`, `git`, `jq`, and `rclone` (v1.73+, native `filen` backend).
+Requires `bash`, `git`, `jq`, and `rclone` with a remote configured.
 
 Configure the remote once, in rclone itself:
 
 ```sh
-rclone config        # new remote → name it "FilenRemote" → type "filen"
-rclone listremotes   # should print: FilenRemote:
+rclone config        # new remote → name it (e.g. "Remote") → pick any backend
+rclone listremotes   # should print: Remote:
 ```
 
 Credentials live in rclone's own config (`~/.config/rclone/rclone.conf`); the
@@ -44,7 +44,7 @@ mark a directory as the root of a tree:
 
 ```sh
 cd ~/Projects
-ferry init FilenRemote:Projects   # writes ~/Projects/.ferry
+ferry init Remote:Projects   # writes ~/Projects/.ferry
 ```
 
 ## Usage
@@ -78,7 +78,7 @@ exists on the cloud; the two delete verbs differ on which side they destroy:
 | `ferry stub <name>` | **must exist** (errors otherwise) | mirror it locally as an empty shell — "browse, then pull" |
 | `ferry new <name>`  | must **not** exist | create it fresh, both sides |
 | `ferry drop <dir>`  | — | delete **local only**; the cloud retains it |
-| `ferry rm <dir>`    | — | delete **both sides** (asks first; Filen trash is the backstop) |
+| `ferry rm <dir>`    | — | delete **both sides** (asks first; recovery depends on the remote's trash/versioning) |
 
 `stub`/`new`/`pull <sub>` are refused inside an already-materialized unit. `drop`
 (presence control) and `rm` (cloud retention) are deliberately separate verbs.
@@ -98,7 +98,7 @@ copy is idempotent, so re-running resumes), ending with an `ok/total` tally.
 
 ```sh
 cd ~/Projects
-ferry init FilenRemote:Projects     # one-time: mark the tree root
+ferry init Remote:Projects     # one-time: mark the tree root
 
 ferry list                          # clients on the cloud
 ferry stub CL03-Initech             # empty local shell of an existing client
@@ -157,8 +157,8 @@ depth. The local side (`>`) is computed offline on every prompt with a single
   under another) and there is exactly one root per tree.
 - **Rename cloud-first** — `mv` renames on the cloud (authoritative) then realigns
   local, and refuses to run from inside the path being moved.
-- **Versioning** — Filen's built-in version history + trash is the recovery
-  backstop; no per-project setup.
+- **Versioning** — the remote's own version history + trash (if it has them) is
+  the recovery backstop; no per-project setup.
 - **Git is optional, per unit** — `.git/` is never transferred. On a git unit,
   `push` bundles full history into `history.bundle` (which rides up with the
   files), and `pull` reattaches it to the working tree.
@@ -167,8 +167,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
 ## ToDo before going public
 - [ ] Review all code
-- [ ] Remove filen references, use a flag for rclone remote with
-  a global env variable for a default
+- [ ] Optional flag for the rclone remote with a global env variable for a
+  default (the remote is currently single-sourced from the root `.ferry`)
 - [ ] Clean Readme
 - [ ] Better the tree structure (graph) of root, stub and unit. Use
   better terms, graph theory based if relevant
