@@ -1,7 +1,8 @@
 # ferry
 
 On-demand, **sparse** sync of a remote tree to/from local disk via
-[rclone](https://rclone.org) — works with any rclone remote. A single place for
+[rclone](https://rclone.org) — **backend-agnostic**: any rclone remote, whether
+filesystem-style (Filen, SFTP) or an object store (S3, GCS). A single place for
 in-progress work that lives **outside GitHub** — no collaboration, sensitive
 data, large files welcome, version control optional.
 
@@ -57,7 +58,7 @@ ferry list  [<dir>]     list a node's children on the remote (no local dir neede
 ferry status [<dir>]    drift for every unit at/under $PWD (the "fetch")
 ferry pull  [<dir>]     materialize a unit; no arg → every unit under $PWD
 ferry push  [<dir>]     send a unit up;     no arg → every unit under $PWD
-ferry new   <name>      create a brand-new unit, both sides (parents fall out)
+ferry new   <name>      start a brand-new unit (cloud prefix appears on first push)
 ferry mv    <old> <new> rename/move a unit or grouping dir (cloud, then local)
 ferry drop  [<dir>]     delete a unit locally; the cloud keeps everything
 ferry rm    <dir>       delete a unit BOTH sides (confirmation-gated)
@@ -77,12 +78,14 @@ the intermediate `CL03-Initech/` on the way down.
 **`new` creates a unit at birth.** The named folder gets an empty marker (so it
 is a unit immediately — `status` sees it, `push` sends it up); any parent dirs
 fall out as markerless grouping dirs. You never `new` a grouping level directly —
-you `new` the leaf and the dirs above it appear. `drop` and `rm` both act on a
-**local unit** and differ on which side they destroy:
+you `new` the leaf and the dirs above it appear. The cloud side is **not**
+pre-created — the prefix materializes on first `push` (an empty folder is anyway
+unrepresentable on object stores). `drop` and `rm` both act on a **local unit**
+and differ on which side they destroy:
 
 | Verb | on the cloud? | does |
 | --- | --- | --- |
-| `ferry new <name>`  | must **not** exist | create a brand-new unit, both sides |
+| `ferry new <name>`  | must **not** exist | start a brand-new unit; cloud prefix on first push |
 | `ferry drop <dir>`  | — | delete the **local** unit; the cloud retains it |
 | `ferry rm <dir>`    | — | delete a **unit** both sides (asks first; recovery depends on the remote's trash/versioning) |
 
@@ -116,9 +119,9 @@ cd CL03-Initech/site
 # ... work on it ...
 ferry push                          # $PWD is a unit → send it up
 
-ferry new ../audit                  # brand-new unit (created on the cloud too)
+ferry new ../audit                  # brand-new unit (cloud prefix appears on first push)
 # ... add files ...
-ferry push ../audit                 # send the new unit's files up
+ferry push ../audit                 # send the new unit's files up (materializes it on the cloud)
 
 cd ~/Projects && ferry status       # drift for every unit under here:
                                     #   >   CL03-Initech/audit   (local edits to push)
@@ -171,6 +174,12 @@ depth. The local side (`>`) is computed offline on every prompt with a single
 - **Git is optional, per unit** — `.git/` is never transferred. On a git unit,
   `push` bundles full history into `history.bundle` (which rides up with the
   files), and `pull` reattaches it to the working tree.
+- **Backend-agnostic** — the tree lives in local markers (never transferred) and
+  every cloud action is delegated to rclone, so the same commands behave the same
+  on filesystem-style and object-store remotes. Nothing relies on cloud
+  directories existing: presence is content. See
+  [ARCHITECTURE.md](ARCHITECTURE.md#backend-agnosticism) for the details and the
+  cost differences that remain (`mv`, `status`, recovery).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 

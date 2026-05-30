@@ -98,7 +98,7 @@ leaf marker sits.
 |---|---|---|
 | `ferry init <base>` | — (writes `.ferry`) | Make `$PWD` a root holding `<base>`. Refused inside an existing tree (no nested roots). |
 | `ferry list [<dir>]` | `rclone lsf --dirs-only --format tp` of `remote_of(dir)` | Remote children of a node (or the root); modtime + name, sorted by name. |
-| `ferry status [<dir>]` | two one-way `rclone check`s per unit (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; from inside a single unit, also the file-level diff. Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
+| `ferry status [<dir>]` | two one-way `rclone check`s per unit, or none if the remote prefix is absent (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; from inside a single unit (with a remote), also the file-level diff. Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
 | `ferry pull [<dir>]` | `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent grouping dirs. No arg → walk units under `$PWD`. |
 | `ferry push [<dir>]` | bundle git, then `rclone copy local→remote`, write marker | Send a unit up; confers unit status on a fresh dir. No arg → walk units under `$PWD`. |
 | `ferry mv <old> <new>` | `rclone moveto`, then `mv` local | Rename/move a unit or grouping dir, cloud-first. |
@@ -114,13 +114,17 @@ it, and the grouping dirs fall out of the pull.
 **`new` creates a unit at birth.** The named folder gets an empty marker — a unit
 immediately, visible to `status` and pushable — and any parent dirs fall out as
 markerless grouping dirs. A grouping level is therefore never created directly;
-you `new` the leaf and the dirs above it appear. Both sides start empty and
-equal, so the sync baseline is recorded at creation. The delete verbs both act on
-a **local unit** and split on which side they destroy:
+you `new` the leaf and the dirs above it appear. The cloud side is **not**
+pre-created: an empty directory is unrepresentable on object stores, so the prefix
+materializes on the first `push`. A never-pushed unit still reads correctly —
+`status` shows `=` while empty, `>` once it holds files (see
+[Backend agnosticism](#backend-agnosticism)). The sync baseline is recorded at
+creation (empty local, empty/absent cloud → in sync). The delete verbs both act
+on a **local unit** and split on which side they destroy:
 
 | Verb | exists on cloud? | effect | cloud |
 |---|---|---|---|
-| `ferry new <name>` | must **not** | create a brand-new unit, both sides | `rclone mkdir` |
+| `ferry new <name>` | must **not** | start a brand-new unit; cloud prefix on first push | — (push) |
 | `ferry drop <dir>` | — | delete the **local** unit — presence control; cloud retains | untouched |
 | `ferry rm <dir>` | — | delete a **unit** both sides — confirmation-gated; recovery depends on the remote's trash/versioning | `rclone purge` |
 
@@ -156,6 +160,47 @@ every descendant's remote for free. It refuses to run from inside the path being
 moved (which would leave the shell on a dead directory). Doing the rename locally
 and pushing instead would orphan the old path on the cloud, since `push` is
 additive.
+
+## Backend agnosticism
+
+ferry runs unchanged on two structurally different remote families — **filesystem-style**
+(Filen, SFTP, local, WebDAV: real directories, cheap rename, can hold empty dirs)
+and **object stores** (S3, GCS, B2, R2: a flat key space, "directories" are just
+key prefixes, no empty dirs, no native rename). It does so **without any
+backend-type branch** in the code. Two design choices make that possible:
+
+1. **Structure lives in local markers, never on the cloud.** The root/unit
+   topology, the derived paths, and the sync state are all local; `.ferry` markers
+   are excluded from every transfer. The cloud is only ever a content store keyed
+   by path. `remote_of(dir) = base + path-under-root` **is** a key prefix — which
+   is exactly what an object store wants and what a filesystem renders as nested
+   dirs. ferry never needs the cloud to model a tree.
+2. **Presence is content** — the lowest common denominator both families share.
+   An empty directory cannot exist on an object store, so ferry never depends on
+   one: `new` does not pre-create a cloud folder (the prefix appears on first
+   `push`), and `probe_unit` treats an absent remote prefix as *no cloud content*
+   (empty unit → `=`, populated → `>`) rather than as an error. This collapses the
+   "empty vs missing directory" ambiguity that object stores cannot answer, so the
+   same status logic is correct on both.
+
+Everything else is delegated to rclone, which already abstracts the backends:
+`copy`, `sync`, `check`, `lsf`, `moveto`, `purge` all produce identical *results*
+on both families. What differs is **cost and recoverability, not behaviour** — and
+those are inherent to the backend, deliberately *not* papered over with conditionals:
+
+| Aspect | Filesystem-style | Object store |
+|---|---|---|
+| `mv` (`rclone moveto`) | O(1) metadata rename | server-side **copy + delete** of every object — O(data), billed, non-atomic |
+| `status` / `check` | local I/O | LIST/HEAD requests per unit — metered, latency-bound |
+| `new` cloud effect | prefix created lazily on push | identical (prefix on push); an empty folder is simply never represented |
+| recovery backstop (`rm`) | native trash / version history | bucket **versioning** must be enabled — no trash concept |
+| `rclone check` integrity | hash | hash, but **multipart** objects fall back to size+mtime (ETag ≠ MD5) |
+
+The takeaway: ferry is generic because it leans on the semantics both backends
+*share* (a keyed blob store, content = presence) and pushes everything backend-specific
+down into rclone or out into operational config (enable bucket versioning) — not
+because it detects the backend and adapts. Adding such a branch would be the wrong
+move; the genericity is a property of the model, not of special-casing.
 
 ## Sync state & prompt indicator
 
@@ -342,9 +387,10 @@ does not use git.
   **atomically renames** it before pushing.
 - A unit is born from `new` (empty marker written at creation) or `pull`; its
   parent dirs are always markerless grouping dirs, created implicitly. A grouping
-  level is never created directly. Browsing an existing cloud folder needs no
-  verb — `list` takes a path and `pull` materializes it. `new` requires the cloud
-  folder not to exist.
+  level is never created directly. `new` does not pre-create the cloud folder —
+  the prefix appears on first `push` — and requires the cloud path not to exist.
+  Browsing an existing cloud folder needs no verb — `list` takes a path and
+  `pull` materializes it.
 - `ferry drop` and `ferry rm` both act only on a **local unit**; `drop` is
   local-only, `rm` deletes both sides (confirmation-gated). A cloud-only path is
   out of scope — use `rclone`. The remote's version history + trash (where

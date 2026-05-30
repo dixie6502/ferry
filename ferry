@@ -20,7 +20,7 @@
 #   ferry status [<dir>]  drift for every unit at/under $PWD
 #   ferry pull [<dir>]    materialize a unit; no arg → every unit under $PWD
 #   ferry push [<dir>]    send a unit up; no arg → every unit under $PWD
-#   ferry new  <name>     create a BRAND-NEW unit, both sides (parents fall out)
+#   ferry new  <name>     start a BRAND-NEW unit (cloud prefix on first push)
 #   ferry mv <old> <new>  rename/move a unit or grouping dir (cloud first, then local)
 #   ferry drop [<dir>]    delete LOCAL only; the cloud keeps its copy
 #   ferry rm   <dir>      delete a unit BOTH sides (confirmation-gated)
@@ -172,12 +172,19 @@ mark_synced() {
 # Probe a unit both ways (two network checks), refresh the prompt's cloud bit,
 # and echo a drift symbol:  =  in sync          >  local ahead (unpushed)
 #                           <  cloud ahead       <>  diverged (both changed)
-# A modified file fails both one-way checks, so it surfaces as '<>'.
+# A modified file fails both one-way checks, so it surfaces as '<>'. When the
+# remote prefix does not exist yet (a never-pushed unit, or an empty unit on an
+# object store that cannot hold empty dirs), there is nothing on the cloud: local
+# content reads as unpushed ('>'), an empty unit as in sync ('=').
 probe_unit() {
     local dir=$1 rp sd up=0 down=0
     rp=$(remote_of "$dir"); sd=$(state_path "$(spec_of "$dir")")
-    rclone check --one-way "${XFER_EXCLUDE[@]}" "$dir" "$rp" >/dev/null 2>&1 || up=1
-    rclone check --one-way "${XFER_EXCLUDE[@]}" "$rp" "$dir" >/dev/null 2>&1 || down=1
+    if remote_exists "$rp"; then
+        rclone check --one-way "${XFER_EXCLUDE[@]}" "$dir" "$rp" >/dev/null 2>&1 || up=1
+        rclone check --one-way "${XFER_EXCLUDE[@]}" "$rp" "$dir" >/dev/null 2>&1 || down=1
+    else
+        [ -n "$(find "$dir" -name .git -prune -o -name "$MARKER" -prune -o -type f -print -quit)" ] && up=1
+    fi
 
     mkdir -p "$sd"   # keep the prompt's cloud ('<') bit fresh
     if [ "$down" = 1 ]; then printf 'behind %s\n' "$(date +%s)" > "$sd/remote"
@@ -318,26 +325,26 @@ cmd_status() {
         printf '%-3s %s\n' "$(probe_unit "$u")" "$(spec_of "$u")"
     done
 
-    [ ${#units[@]} -eq 1 ] && \
+    if [ ${#units[@]} -eq 1 ] && remote_exists "$(remote_of "${units[0]}")"; then
         rclone check "${XFER_EXCLUDE[@]}" "${units[0]}" "$(remote_of "${units[0]}")" || true
+    fi
 }
 
-# Create a brand-new unit on both sides. The named target becomes a unit at
-# birth (empty marker); any parent dirs are created markerless on the way down
-# (mkdir -p locally, rclone mkdir on the cloud). Both sides start empty and equal,
-# so the sync baseline is recorded immediately.
+# Create a brand-new unit locally; the cloud prefix materializes on first push.
+# The named target becomes a unit at birth (empty marker); parent dirs are created
+# markerless by mkdir -p. We do not pre-create the cloud folder: an empty dir is
+# unrepresentable on object stores, and a never-pushed unit reads correctly anyway
+# (status: '=' empty, '>' once it holds files). Refused if the cloud path exists.
 cmd_new() {
     local name=${1:-}; [ -n "$name" ] || die "usage: $PROG new <name>"
     local target; target=$(resolve_target "$name")
     refuse_in_unit "$target"
     [ -e "$target" ] && die "already exists: $target"
-    local rp; rp=$(remote_of "$target")
-    remote_exists "$rp" && die "already on cloud: $rp (use 'pull' to fetch it)"
-    rclone mkdir "$rp"
+    remote_exists "$(remote_of "$target")" && die "already on cloud: $(remote_of "$target") (use 'pull' to fetch it)"
     mkdir -p "$target"
     : > "$target/$MARKER"            # confer unit status at birth
     mark_synced "$(spec_of "$target")"
-    printf '%s: created unit %s on both sides\n' "$PROG" "$(spec_of "$target")"
+    printf '%s: created unit %s (push to materialize on the cloud)\n' "$PROG" "$(spec_of "$target")"
 }
 
 cmd_pull() {
