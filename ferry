@@ -20,10 +20,10 @@
 #   ferry status [<dir>]  drift for every unit at/under $PWD
 #   ferry pull [<dir>]    materialize a unit; no arg → every unit under $PWD
 #   ferry push [<dir>]    send a unit up; no arg → every unit under $PWD
-#   ferry new  <name>     create a BRAND-NEW folder, both sides
+#   ferry new  <name>     create a BRAND-NEW unit, both sides (parents fall out)
 #   ferry mv <old> <new>  rename/move a unit or grouping dir (cloud first, then local)
 #   ferry drop [<dir>]    delete LOCAL only; the cloud keeps its copy
-#   ferry rm   <dir>      delete BOTH sides (confirmation-gated)
+#   ferry rm   <dir>      delete a unit BOTH sides (confirmation-gated)
 #
 # Flags: --mirror (propagate deletions, single <dir> only), -y/--yes (skip prompts).
 #
@@ -322,6 +322,10 @@ cmd_status() {
         rclone check "${XFER_EXCLUDE[@]}" "${units[0]}" "$(remote_of "${units[0]}")" || true
 }
 
+# Create a brand-new unit on both sides. The named target becomes a unit at
+# birth (empty marker); any parent dirs are created markerless on the way down
+# (mkdir -p locally, rclone mkdir on the cloud). Both sides start empty and equal,
+# so the sync baseline is recorded immediately.
 cmd_new() {
     local name=${1:-}; [ -n "$name" ] || die "usage: $PROG new <name>"
     local target; target=$(resolve_target "$name")
@@ -331,7 +335,9 @@ cmd_new() {
     remote_exists "$rp" && die "already on cloud: $rp (use 'pull' to fetch it)"
     rclone mkdir "$rp"
     mkdir -p "$target"
-    printf '%s: created %s on both sides\n' "$PROG" "$(spec_of "$target")"
+    : > "$target/$MARKER"            # confer unit status at birth
+    mark_synced "$(spec_of "$target")"
+    printf '%s: created unit %s on both sides\n' "$PROG" "$(spec_of "$target")"
 }
 
 cmd_pull() {
@@ -376,10 +382,12 @@ cmd_drop() {
     printf '%s: dropped %s (cloud retains it)\n' "$PROG" "$spec"
 }
 
+# Delete a unit on BOTH sides. Restricted to a local unit: cloud-only paths are
+# out of scope (use rclone directly), and a grouping dir is never purged wholesale.
 cmd_rm() {
     local yes=$1 arg=${2:-}
     [ -n "$arg" ] || die "usage: $PROG rm <dir>"
-    local target; target=$(resolve_target "$arg")
+    local target; target=$(unit_target "$arg")
     refuse_cwd_inside "$target"
     local rp spec; rp=$(remote_of "$target"); spec=$(spec_of "$target")
     confirm "$yes" "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"

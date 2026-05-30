@@ -7,8 +7,8 @@ data, large files welcome, version control optional.
 
 Nothing runs in the background: every transfer is an explicit command. The local
 tree is a **partial mirror** of the remote — a directory is present only because
-you pulled it. Where things live is decided by `.ferry` **marker files**, not by
-any fixed folder depth.
+you pulled or created it. Where things live is decided by `.ferry` **marker
+files**, not by any fixed folder depth.
 
 ```
 ~/Projects/.ferry            root   → holds the remote base "Remote:Projects"
@@ -20,8 +20,9 @@ any fixed folder depth.
 
 - **root** — the one directory whose `.ferry` holds the remote base. Found by
   walking **up** from `$PWD`, exactly like git finds `.git`. One per tree.
-- **unit** — a materialized leaf (an empty `.ferry`, none below it). The
-  granularity of every transfer, git bundle, and sync record.
+- **unit** — a leaf (an empty `.ferry`, none below it), present locally because
+  you pulled or `new`ed it. The granularity of every transfer, git bundle, and
+  sync record.
 - Directories **between** root and unit hold no marker. They appear on the way
   down to a unit (a deep `pull`/`new` creates them) and exist only to navigate.
 
@@ -56,10 +57,10 @@ ferry list  [<dir>]     list a node's children on the remote (no local dir neede
 ferry status [<dir>]    drift for every unit at/under $PWD (the "fetch")
 ferry pull  [<dir>]     materialize a unit; no arg → every unit under $PWD
 ferry push  [<dir>]     send a unit up;     no arg → every unit under $PWD
-ferry new   <name>      create a brand-new folder, both sides
+ferry new   <name>      create a brand-new unit, both sides (parents fall out)
 ferry mv    <old> <new> rename/move a unit or grouping dir (cloud, then local)
-ferry drop  [<dir>]     delete the local copy; the cloud keeps everything
-ferry rm    <dir>       delete BOTH sides (confirmation-gated)
+ferry drop  [<dir>]     delete a unit locally; the cloud keeps everything
+ferry rm    <dir>       delete a unit BOTH sides (confirmation-gated)
 ```
 
 Most verbs take an optional `<dir>` (relative to `$PWD`); omitted, they act on
@@ -73,18 +74,22 @@ no local directory required: `ferry list CL03-Initech` shows its cloud children.
 A deep `ferry pull CL03-Initech/site` then materializes just that one, creating
 the intermediate `CL03-Initech/` on the way down.
 
-**Creating with `new` never marks the folder.** It leaves a markerless grouping
-dir; a folder becomes a *unit* only when content first flows through it
-(`pull`/`push`). `drop` and `rm` differ on which side they destroy:
+**`new` creates a unit at birth.** The named folder gets an empty marker (so it
+is a unit immediately — `status` sees it, `push` sends it up); any parent dirs
+fall out as markerless grouping dirs. You never `new` a grouping level directly —
+you `new` the leaf and the dirs above it appear. `drop` and `rm` both act on a
+**local unit** and differ on which side they destroy:
 
 | Verb | on the cloud? | does |
 | --- | --- | --- |
-| `ferry new <name>`  | must **not** exist | create it fresh, both sides |
-| `ferry drop <dir>`  | — | delete **local only**; the cloud retains it |
-| `ferry rm <dir>`    | — | delete **both sides** (asks first; recovery depends on the remote's trash/versioning) |
+| `ferry new <name>`  | must **not** exist | create a brand-new unit, both sides |
+| `ferry drop <dir>`  | — | delete the **local** unit; the cloud retains it |
+| `ferry rm <dir>`    | — | delete a **unit** both sides (asks first; recovery depends on the remote's trash/versioning) |
 
 `new`/`pull <sub>` are refused inside an already-materialized unit. `drop`
 (presence control) and `rm` (cloud retention) are deliberately separate verbs.
+`rm` refuses anything that is not a local unit — to delete a cloud-only folder,
+or a whole grouping subtree, use `rclone` directly.
 
 ### No-arg walk & flags
 
@@ -111,9 +116,9 @@ cd CL03-Initech/site
 # ... work on it ...
 ferry push                          # $PWD is a unit → send it up
 
-ferry new ../audit                  # brand-new folder (created on the cloud too)
+ferry new ../audit                  # brand-new unit (created on the cloud too)
 # ... add files ...
-ferry push ../audit                 # first push confers unit status
+ferry push ../audit                 # send the new unit's files up
 
 cd ~/Projects && ferry status       # drift for every unit under here:
                                     #   >   CL03-Initech/audit   (local edits to push)
@@ -153,8 +158,9 @@ depth. The local side (`>`) is computed offline on every prompt with a single
 
 - **Additive by default** — `copy` never deletes the far side. Deletions
   propagate only with `--mirror` (`rclone sync`).
-- **Presence = pulled** — a unit is local iff you pulled it. `drop` frees disk;
-  the cloud is authoritative for retention (`rm` is the explicit exception).
+- **Presence = pulled or created** — a unit is local because you pulled it or
+  `new`ed it. `drop` frees disk; the cloud is authoritative for retention (`rm`,
+  which acts only on a local unit, is the explicit exception).
 - **Derived paths, one root** — the remote base is stored once, at the root;
   every other path is computed from structure. Units form an antichain (no unit
   under another) and there is exactly one root per tree.

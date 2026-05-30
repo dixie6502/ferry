@@ -43,8 +43,9 @@ on-demand checkout. The tree shape is emergent, not fixed at any depth.
 
 - **root** — the one directory whose `.ferry` holds the remote base. Found by
   walking **up** from `$PWD` (git's `.git` model). Exactly one per tree.
-- **unit** — a materialized leaf: an empty `.ferry`, with no `.ferry` below it. The
-  granularity of every transfer, git bundle, and sync-state record.
+- **unit** — a leaf: an empty `.ferry`, with no `.ferry` below it, present locally
+  because it was pulled or `new`ed. The granularity of every transfer, git bundle,
+  and sync-state record.
 - **grouping dirs** — the markerless directories between root and unit. They are
   created on the way down by a deep `pull`/`new` and exist only to navigate; they
   are never a sync target.
@@ -70,7 +71,7 @@ silently.
 ## Sync model
 
 On-demand, command-driven transfers with rclone — nothing runs in the
-background. A project is on local disk only because it was pulled.
+background. A project is on local disk only because it was pulled or created.
 
 Chosen because usage is **mostly archive dip-in** (pull a project, re-check it,
 drop it), plus a few active projects. On-demand fetch is the idiomatic fit and
@@ -89,8 +90,9 @@ per-command opt-in — so a local delete never reaches the cloud unless asked.
 ## `ferry` verbs
 
 The whole model is two tree walks: **up** to the root for the base, **down** to
-the unit leaves (`find . -name .ferry`, keep the leaves) for what to transfer. That
-replaces all depth/scope arithmetic — a unit is wherever a leaf marker sits.
+the unit leaves (`find . -name .ferry -empty`, keep the leaves) for what to
+transfer. That replaces all depth/scope arithmetic — a unit is wherever an empty
+leaf marker sits.
 
 | Verb | rclone mapping | Purpose |
 |---|---|---|
@@ -109,15 +111,22 @@ a unit while `mkdir -p` creates the grouping dirs above it. So the "mirror the
 cloud shape as an empty shell" step has no dedicated verb — `list` + `pull` cover
 it, and the grouping dirs fall out of the pull.
 
-**`new` never marks.** It yields a markerless grouping dir; a folder becomes a
-*unit* only when content flows through it (`pull`/`push`). The delete verbs split
-on which side they destroy:
+**`new` creates a unit at birth.** The named folder gets an empty marker — a unit
+immediately, visible to `status` and pushable — and any parent dirs fall out as
+markerless grouping dirs. A grouping level is therefore never created directly;
+you `new` the leaf and the dirs above it appear. Both sides start empty and
+equal, so the sync baseline is recorded at creation. The delete verbs both act on
+a **local unit** and split on which side they destroy:
 
 | Verb | exists on cloud? | effect | cloud |
 |---|---|---|---|
-| `ferry new <name>` | must **not** | create a brand-new folder, both sides | `rclone mkdir` |
-| `ferry drop <dir>` | — | delete **local only** — presence control; cloud retains | untouched |
-| `ferry rm <dir>` | — | delete **both sides** — confirmation-gated; recovery depends on the remote's trash/versioning | `rclone purge` |
+| `ferry new <name>` | must **not** | create a brand-new unit, both sides | `rclone mkdir` |
+| `ferry drop <dir>` | — | delete the **local** unit — presence control; cloud retains | untouched |
+| `ferry rm <dir>` | — | delete a **unit** both sides — confirmation-gated; recovery depends on the remote's trash/versioning | `rclone purge` |
+
+`rm` is restricted to a local unit: a cloud-only path or a whole grouping subtree
+is out of scope — use `rclone` directly for those (the model never deletes
+something it does not hold locally).
 
 `new` / `pull <sub>` are refused inside a unit's subtree — you are already in
 materialized content, there is nothing to fetch or place. `drop` and `rm` are
@@ -188,11 +197,12 @@ and a clean large tree is an O(tree) walk per prompt (no early exit), the same
 
 ## Presence control
 
-Native to the model: a unit is local **iff** it was pulled. `ferry drop`
-deletes the local copy; the cloud keeps it. Dormant projects are simply never
-pulled — that is the disk-space control, no extra mechanism. `ferry rm` is the
-deliberate exception that also deletes the cloud copy (confirmation-gated, with
-the remote's trash as the backstop where available); it is kept separate from `drop` so retention and
+Native to the model: a unit is local because it was pulled or `new`ed. `ferry
+drop` deletes the local copy; the cloud keeps it. Dormant projects are simply
+never pulled — that is the disk-space control, no extra mechanism. `ferry rm` is
+the deliberate exception that also deletes the cloud copy (confirmation-gated,
+with the remote's trash as the backstop where available); like `drop` it acts
+only on a local unit, and it is kept separate from `drop` so retention and
 presence stay distinct.
 
 ## Versioning
@@ -330,12 +340,15 @@ does not use git.
 - `.git/` and `.ferry` are **always** excluded from transfers (`--exclude`).
 - `ferry push` on a git project writes the bundle to a temp name and
   **atomically renames** it before pushing.
-- Creation never marks: `new` makes a markerless grouping dir; only `pull`/`push`
-  confer unit status. Browsing an existing cloud folder needs no verb — `list`
-  takes a path and `pull` materializes it. `new` requires the cloud folder not to
-  exist.
-- `ferry drop` is local-only; `ferry rm` deletes both sides (confirmation-gated).
-  The remote's version history + trash (where available) is the recovery backstop.
+- A unit is born from `new` (empty marker written at creation) or `pull`; its
+  parent dirs are always markerless grouping dirs, created implicitly. A grouping
+  level is never created directly. Browsing an existing cloud folder needs no
+  verb — `list` takes a path and `pull` materializes it. `new` requires the cloud
+  folder not to exist.
+- `ferry drop` and `ferry rm` both act only on a **local unit**; `drop` is
+  local-only, `rm` deletes both sides (confirmation-gated). A cloud-only path is
+  out of scope — use `rclone`. The remote's version history + trash (where
+  available) is the recovery backstop.
 - Per-machine sync state lives in `${XDG_CACHE_HOME:-~/.cache}/ferry`, never in the
   synced tree, keyed by unit path; `push`/`pull` re-baseline it, `status`
   refreshes the cloud bit, `mv` carries it, `drop`/`rm` delete it.
