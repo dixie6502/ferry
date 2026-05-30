@@ -91,7 +91,7 @@ replaces all depth/scope arithmetic — a unit is wherever a leaf marker sits.
 | Verb | rclone mapping | Purpose |
 |---|---|---|
 | `ferry init <base>` | — (writes `.ferry`) | Make `$PWD` a root holding `<base>`. Refused inside an existing tree (no nested roots). |
-| `ferry list [<dir>]` | `rclone lsjson` of `remote_of(dir)` | Remote children of a node (or the root). |
+| `ferry list [<dir>]` | `rclone lsf --dirs-only --format tp` of `remote_of(dir)` | Remote children of a node (or the root); modtime + name, sorted by name. |
 | `ferry status [<dir>]` | one-way `rclone check` to record the cloud bit, then `rclone check` for display | Drift for the unit at/above `$PWD`. Refreshes the prompt's cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
 | `ferry pull [<dir>]` | `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent stubs. No arg → walk units under `$PWD`. |
 | `ferry push [<dir>]` | bundle git, then `rclone copy local→remote`, write marker | Send a unit up; confers unit status on a fresh dir. No arg → walk units under `$PWD`. |
