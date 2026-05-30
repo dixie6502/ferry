@@ -12,7 +12,7 @@ any fixed folder depth.
 
 ```
 ~/Projects/.ferry            root   → holds the remote base "Remote:Projects"
-  CL03-Initech/               stub   (a grouping dir — no marker)
+  CL03-Initech/                      grouping dir — no marker, just on the path
     site/.ferry               unit   ← a transfer unit (empty marker)
     audit/.ferry              unit
   Academic/thesis/refs/.ferry unit   ← any depth, no configuration
@@ -20,9 +20,10 @@ any fixed folder depth.
 
 - **root** — the one directory whose `.ferry` holds the remote base. Found by
   walking **up** from `$PWD`, exactly like git finds `.git`. One per tree.
-- **stub** — a bare grouping directory. Exists only to navigate into.
 - **unit** — a materialized leaf (an empty `.ferry`, none below it). The
   granularity of every transfer, git bundle, and sync record.
+- Directories **between** root and unit hold no marker. They appear on the way
+  down to a unit (a deep `pull`/`new` creates them) and exist only to navigate.
 
 A node's remote path is **derived** — `<base>` + its path under the root — so you
 never spell out both sides, and a rename recomputes everything beneath it for free.
@@ -51,13 +52,12 @@ ferry init Remote:Projects   # writes ~/Projects/.ferry
 
 ```
 ferry init <base>       make $PWD a root holding <base> (no nested roots)
-ferry list  [<dir>]     list a node's children on the remote
-ferry status [<dir>]    show drift for the unit at/above $PWD (the "fetch")
+ferry list  [<dir>]     list a node's children on the remote (no local dir needed)
+ferry status [<dir>]    drift for every unit at/under $PWD (the "fetch")
 ferry pull  [<dir>]     materialize a unit; no arg → every unit under $PWD
 ferry push  [<dir>]     send a unit up;     no arg → every unit under $PWD
-ferry stub  <name>      mirror an existing cloud folder as an empty local shell
 ferry new   <name>      create a brand-new folder, both sides
-ferry mv    <old> <new> rename/move a stub or unit (cloud, then local)
+ferry mv    <old> <new> rename/move a unit or grouping dir (cloud, then local)
 ferry drop  [<dir>]     delete the local copy; the cloud keeps everything
 ferry rm    <dir>       delete BOTH sides (confirmation-gated)
 ```
@@ -66,21 +66,24 @@ Most verbs take an optional `<dir>` (relative to `$PWD`); omitted, they act on
 `$PWD`. The whole model is two walks: **up** to the root for the base, **down**
 to the unit leaves for what to transfer.
 
-### Create & delete — by cloud precondition
+### Browse, create & delete
 
-**Creating a folder never marks it.** `stub` and `new` both leave a markerless
-grouping dir; a folder becomes a *unit* only when content first flows through it
-(`pull`/`push`). The two creation verbs differ on whether the folder already
-exists on the cloud; the two delete verbs differ on which side they destroy:
+**To browse** an existing cloud folder before pulling, point `list` at its path —
+no local directory required: `ferry list CL03-Initech` shows its cloud children.
+A deep `ferry pull CL03-Initech/site` then materializes just that one, creating
+the intermediate `CL03-Initech/` on the way down.
+
+**Creating with `new` never marks the folder.** It leaves a markerless grouping
+dir; a folder becomes a *unit* only when content first flows through it
+(`pull`/`push`). `drop` and `rm` differ on which side they destroy:
 
 | Verb | on the cloud? | does |
 | --- | --- | --- |
-| `ferry stub <name>` | **must exist** (errors otherwise) | mirror it locally as an empty shell — "browse, then pull" |
 | `ferry new <name>`  | must **not** exist | create it fresh, both sides |
 | `ferry drop <dir>`  | — | delete **local only**; the cloud retains it |
 | `ferry rm <dir>`    | — | delete **both sides** (asks first; recovery depends on the remote's trash/versioning) |
 
-`stub`/`new`/`pull <sub>` are refused inside an already-materialized unit. `drop`
+`new`/`pull <sub>` are refused inside an already-materialized unit. `drop`
 (presence control) and `rm` (cloud retention) are deliberately separate verbs.
 
 ### No-arg walk & flags
@@ -98,28 +101,28 @@ copy is idempotent, so re-running resumes), ending with an `ok/total` tally.
 
 ```sh
 cd ~/Projects
-ferry init Remote:Projects     # one-time: mark the tree root
+ferry init Remote:Projects          # one-time: mark the tree root
 
 ferry list                          # clients on the cloud
-ferry stub CL03-Initech             # empty local shell of an existing client
-cd CL03-Initech
-ferry list                          # its projects on the cloud
-ferry pull site                     # materialize just this one → CL03-Initech/site
+ferry list CL03-Initech             # browse a client's projects — no local dir needed
+ferry pull CL03-Initech/site        # materialize just this one (creates CL03-Initech/)
 
-cd site
+cd CL03-Initech/site
 # ... work on it ...
 ferry push                          # $PWD is a unit → send it up
-ferry status                        # drift vs the cloud
 
-ferry new audit                     # brand-new folder (created on the cloud too)
+ferry new ../audit                  # brand-new folder (created on the cloud too)
 # ... add files ...
-ferry push audit                    # first push confers unit status
+ferry push ../audit                 # first push confers unit status
 
-cd ~/Projects && ferry push         # walk: push every local unit under here
+cd ~/Projects && ferry status       # drift for every unit under here:
+                                    #   >   CL03-Initech/audit   (local edits to push)
+                                    #   <   Academic/thesis/refs (cloud changes to pull)
+ferry push                          # walk: push every local unit under here
 
 cd ~                                # mv/rm won't run from inside the target
 ferry drop CL03-Initech/site        # free local disk; cloud keeps it
-ferry mv CL03-Initech CL03-Init     # rename a stub (cloud, then local)
+ferry mv CL03-Initech CL03-Init     # rename a grouping dir (cloud, then local)
 ```
 
 ## Prompt indicator
@@ -170,6 +173,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 - [ ] Optional flag for the rclone remote with a global env variable for a
   default (the remote is currently single-sourced from the root `.ferry`)
 - [ ] Clean Readme
-- [ ] Better the tree structure (graph) of root, stub and unit. Use
+- [ ] Better the tree structure (graph) of root and unit. Use
   better terms, graph theory based if relevant
 - [ ] Find a nice ascii draw of a ferry!

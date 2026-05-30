@@ -6,21 +6,22 @@
 #
 #   root   a directory whose `.ferry` holds the remote base ("Remote:Projects").
 #          Found by walking UP from $PWD. Exactly one per tree.
-#   stub   a bare grouping directory, no marker. Navigation only.
 #   unit   a leaf marker (empty `.ferry`, none below it). The granularity of every
 #          transfer, git bundle and sync-state record.
+#
+# Directories between the root and a unit hold no marker; they are created on the
+# way down by a deep `pull`/`new` and exist only to navigate.
 #
 # A node's remote path is DERIVED: <base> + <path under the root>. The base is
 # stored once, at the root; nothing else stores a path.
 #
 #   ferry init <base>     make $PWD a root holding <base>   (no nested roots)
-#   ferry list [<dir>]    remote children of a node
-#   ferry status [<dir>]  drift for the unit at/above $PWD
+#   ferry list [<dir>]    remote children of a node (no local dir needed)
+#   ferry status [<dir>]  drift for every unit at/under $PWD
 #   ferry pull [<dir>]    materialize a unit; no arg → every unit under $PWD
 #   ferry push [<dir>]    send a unit up; no arg → every unit under $PWD
-#   ferry stub <name>     mirror an EXISTING cloud folder as an empty local shell
 #   ferry new  <name>     create a BRAND-NEW folder, both sides
-#   ferry mv <old> <new>  rename/move a stub or unit (cloud first, then local)
+#   ferry mv <old> <new>  rename/move a unit or grouping dir (cloud first, then local)
 #   ferry drop [<dir>]    delete LOCAL only; the cloud keeps its copy
 #   ferry rm   <dir>      delete BOTH sides (confirmation-gated)
 #
@@ -95,7 +96,7 @@ remote_of() {
 spec_of() { local rel=${1#"$ROOT"}; printf '%s' "${rel#/}"; }
 
 # Absolute path of an optional <dir> argument (relative to $PWD), or $PWD itself.
-# The target need not exist yet (stub/new/pull create it).
+# The target need not exist yet (new/pull create it).
 resolve_target() {
     local here; here=$(pwd -P)
     if [ -n "${1:-}" ]; then validate_name "$1"; printf '%s/%s' "$here" "$1"
@@ -107,8 +108,9 @@ resolve_target() {
 # dir/.ferry does not count) — i.e. it is a grouping node, not a leaf.
 has_sub_marker() { find "$1" -mindepth 2 -name "$MARKER" -type f -print -quit | grep -q .; }
 
-# A unit = a marked directory that is a leaf of the marker tree.
-is_unit() { [ -f "$1/$MARKER" ] && ! has_sub_marker "$1"; }
+# A unit = a directory with an EMPTY marker (the root marker has content) that is
+# a leaf of the marker tree.
+is_unit() { [ -f "$1/$MARKER" ] && [ ! -s "$1/$MARKER" ] && ! has_sub_marker "$1"; }
 
 # The nearest unit at or above a directory (stopping below the root), if any —
 # i.e. whether the directory sits inside already-materialized content. A unit
@@ -137,10 +139,11 @@ refuse_cwd_inside() {
     case "$here/" in "$tgt/"*) die "cd out of $1 first" ;; esac
 }
 
-# Every unit at/under a directory (walk down): marker dirs with no marker dir
-# below them. One line per absolute unit path.
+# Every unit at/under a directory (walk down): EMPTY-marker dirs (the root's
+# content marker is excluded by -empty) with no marker dir below them. One line
+# per absolute unit path.
 units_under() {
-    local -a mdirs; mapfile -t mdirs < <(find "$1" -name "$MARKER" -type f -printf '%h\n' | sort)
+    local -a mdirs; mapfile -t mdirs < <(find "$1" -name "$MARKER" -type f -empty -printf '%h\n' | sort)
     local d e leaf
     for d in "${mdirs[@]}"; do
         leaf=1
@@ -166,15 +169,21 @@ mark_synced() {
     printf 'sync %s\n' "$(date +%s)" > "$sd/remote"
 }
 
-# Record whether the cloud holds anything the local unit lacks/differs on (a
-# one-way check from the remote, ignoring local-only files).
-record_remote() {
-    local dir=$1 sd; sd=$(state_path "$(spec_of "$dir")"); mkdir -p "$sd"
-    if rclone check --one-way "${XFER_EXCLUDE[@]}" "$(remote_of "$dir")" "$dir" >/dev/null 2>&1; then
-        printf 'sync %s\n' "$(date +%s)" > "$sd/remote"
-    else
-        printf 'behind %s\n' "$(date +%s)" > "$sd/remote"
-    fi
+# Probe a unit both ways (two network checks), refresh the prompt's cloud bit,
+# and echo a drift symbol:  =  in sync          >  local ahead (unpushed)
+#                           <  cloud ahead       <>  diverged (both changed)
+# A modified file fails both one-way checks, so it surfaces as '<>'.
+probe_unit() {
+    local dir=$1 rp sd up=0 down=0
+    rp=$(remote_of "$dir"); sd=$(state_path "$(spec_of "$dir")")
+    rclone check --one-way "${XFER_EXCLUDE[@]}" "$dir" "$rp" >/dev/null 2>&1 || up=1
+    rclone check --one-way "${XFER_EXCLUDE[@]}" "$rp" "$dir" >/dev/null 2>&1 || down=1
+
+    mkdir -p "$sd"   # keep the prompt's cloud ('<') bit fresh
+    if [ "$down" = 1 ]; then printf 'behind %s\n' "$(date +%s)" > "$sd/remote"
+    else printf 'sync %s\n' "$(date +%s)" > "$sd/remote"; fi
+
+    case "$up$down" in 00) printf '=' ;; 10) printf '>' ;; 01) printf '<' ;; 11) printf '<>' ;; esac
 }
 
 # Move bytes src -> dst, excluding git internals and markers. mirror=1 propagates
@@ -297,21 +306,20 @@ cmd_list() {
         "$(remote_of "$(resolve_target "${1:-}")")" | sort -k3
 }
 
+# Drift for every unit at/under the target (or $PWD): one symbol+spec row each.
+# From inside a single unit, also list the files that differ.
 cmd_status() {
-    local target; target=$(unit_target "${1:-}")
-    record_remote "$target"
-    rclone check "${XFER_EXCLUDE[@]}" "$target" "$(remote_of "$target")"
-}
+    local target; target=$(resolve_target "${1:-}")
+    local -a units; mapfile -t units < <(units_under "$target")
+    [ ${#units[@]} -gt 0 ] || die "no units under $(spec_of "$target")"
 
-cmd_stub() {
-    local name=${1:-}; [ -n "$name" ] || die "usage: $PROG stub <name>"
-    local target; target=$(resolve_target "$name")
-    refuse_in_unit "$target"
-    [ -e "$target" ] && die "already exists: $target"
-    local rp; rp=$(remote_of "$target")
-    remote_exists "$rp" || die "not on cloud: $rp (use 'new' to create it)"
-    mkdir -p "$target"
-    printf '%s: stubbed %s (mirrors %s)\n' "$PROG" "$(spec_of "$target")" "$rp"
+    local u
+    for u in "${units[@]}"; do
+        printf '%-3s %s\n' "$(probe_unit "$u")" "$(spec_of "$u")"
+    done
+
+    [ ${#units[@]} -eq 1 ] && \
+        rclone check "${XFER_EXCLUDE[@]}" "${units[0]}" "$(remote_of "${units[0]}")" || true
 }
 
 cmd_new() {
@@ -320,7 +328,7 @@ cmd_new() {
     refuse_in_unit "$target"
     [ -e "$target" ] && die "already exists: $target"
     local rp; rp=$(remote_of "$target")
-    remote_exists "$rp" && die "already on cloud: $rp (use 'stub' to mirror it)"
+    remote_exists "$rp" && die "already on cloud: $rp (use 'pull' to fetch it)"
     rclone mkdir "$rp"
     mkdir -p "$target"
     printf '%s: created %s on both sides\n' "$PROG" "$(spec_of "$target")"
@@ -381,7 +389,7 @@ cmd_rm() {
     printf '%s: removed %s from both sides\n' "$PROG" "$spec"
 }
 
-# Rename/move a stub or unit. Cloud is authoritative: move there first, then
+# Rename/move a unit or grouping dir. Cloud is authoritative: move there first, then
 # realign local and carry the sync-state subtree. Names mirror remote, so every
 # descendant's derived remote follows the move for free.
 cmd_mv() {
@@ -437,7 +445,6 @@ main() {
         init)   cmd_init "${1:-}" ;;
         list)   cmd_list "${1:-}" ;;
         status) cmd_status "${1:-}" ;;
-        stub)   cmd_stub "${1:-}" ;;
         new)    cmd_new "${1:-}" ;;
         pull)   cmd_pull "$mirror" "${1:-}" ;;
         push)   cmd_push "$mirror" "${1:-}" ;;

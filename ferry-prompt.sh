@@ -56,8 +56,8 @@ __ferry_ps1_local_changed() {
 }
 
 # Emit the indicator for the unit enclosing $PWD, wrapped in the format string
-# ($1, default " (%s)"). Silent when not inside a unit (a stub, the root with
-# children, or outside any tree).
+# ($1, default " (%s)"). Silent when not inside a unit (a grouping dir, the root
+# with children, or outside any tree).
 __ferry_ps1() {
     local fmt=${1:-" (%s)"}
     local d=$PWD unit="" root=""
@@ -74,7 +74,7 @@ __ferry_ps1() {
     [ -n "$root" ] || return   # not inside a ferry tree
 
     # No enclosing empty-marker unit: only valid if the root is itself a leaf
-    # (a single-unit tree). If the root has sub-markers, $PWD is in a stub.
+    # (a single-unit tree). If the root has sub-markers, $PWD is in a grouping dir.
     if [ -z "$unit" ]; then
         [ -z "$(find "$root" -mindepth 2 -name "$FERRY_MARKER" -print -quit 2>/dev/null)" ] || return
         unit=$root

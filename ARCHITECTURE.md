@@ -34,22 +34,25 @@ on-demand checkout. The tree shape is emergent, not fixed at any depth.
 
 ```
 ~/Projects/.ferry             root   → contains "Remote:Projects"
-  CL03-Initech/              stub   (grouping dir, no marker)
+  CL03-Initech/                      grouping dir, no marker
     site/.ferry                unit   ← transfer unit (empty marker)
     audit/.ferry               unit   ← transfer unit
-  Academic/                  stub
+  Academic/                          grouping dir, no marker
     thesis/refs/.ferry         unit   ← arbitrary depth, no config
 ```
 
 - **root** — the one directory whose `.ferry` holds the remote base. Found by
   walking **up** from `$PWD` (git's `.git` model). Exactly one per tree.
-- **stub** — a bare grouping directory, no marker. Exists only for navigation.
 - **unit** — a materialized leaf: an empty `.ferry`, with no `.ferry` below it. The
   granularity of every transfer, git bundle, and sync-state record.
+- **grouping dirs** — the markerless directories between root and unit. They are
+  created on the way down by a deep `pull`/`new` and exist only to navigate; they
+  are never a sync target.
 
 Two invariants keep discovery unambiguous: **units form an antichain** (no unit
 under another — a full pull already brought everything beneath it), and **one
-root per tree** (no content-bearing `.ferry` under another).
+root per tree** (no content-bearing `.ferry` under another). A unit marker is
+empty; the root marker has content — so the root is never mistaken for a unit.
 
 ### Remote mapping (derived, single-sourced)
 
@@ -60,8 +63,9 @@ remote_of(dir) = <root base> + (dir relative to root)
 ```
 
 The base is stored **once**, at the root; nothing else stores a path. A `mv` of a
-stub recomputes every descendant's remote for free; a hand `mv` that diverges
-local from remote fails loudly on the next sync rather than orphaning silently.
+grouping dir recomputes every descendant's remote for free; a hand `mv` that
+diverges local from remote fails loudly on the next sync rather than orphaning
+silently.
 
 ## Sync model
 
@@ -92,37 +96,42 @@ replaces all depth/scope arithmetic — a unit is wherever a leaf marker sits.
 |---|---|---|
 | `ferry init <base>` | — (writes `.ferry`) | Make `$PWD` a root holding `<base>`. Refused inside an existing tree (no nested roots). |
 | `ferry list [<dir>]` | `rclone lsf --dirs-only --format tp` of `remote_of(dir)` | Remote children of a node (or the root); modtime + name, sorted by name. |
-| `ferry status [<dir>]` | one-way `rclone check` to record the cloud bit, then `rclone check` for display | Drift for the unit at/above `$PWD`. Refreshes the prompt's cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
-| `ferry pull [<dir>]` | `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent stubs. No arg → walk units under `$PWD`. |
+| `ferry status [<dir>]` | two one-way `rclone check`s per unit (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; from inside a single unit, also the file-level diff. Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
+| `ferry pull [<dir>]` | `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent grouping dirs. No arg → walk units under `$PWD`. |
 | `ferry push [<dir>]` | bundle git, then `rclone copy local→remote`, write marker | Send a unit up; confers unit status on a fresh dir. No arg → walk units under `$PWD`. |
-| `ferry mv <old> <new>` | `rclone moveto`, then `mv` local | Rename/move a stub or unit, cloud-first. |
+| `ferry mv <old> <new>` | `rclone moveto`, then `mv` local | Rename/move a unit or grouping dir, cloud-first. |
 
-### Create & delete — by cloud precondition
+### Browse, create & delete
 
-**Creation never marks.** `stub` and `new` both yield a markerless grouping dir;
-a folder becomes a *unit* only when content flows through it (`pull`/`push`). The
-two creation verbs split on whether the target already exists on the cloud; the
-two delete verbs split on which side they destroy:
+**Browsing needs no local folder.** `list` derives the remote from a path and
+lists it directly (`ferry list CL03-Initech`), and a deep `pull a/b` materializes
+a unit while `mkdir -p` creates the grouping dirs above it. So the "mirror the
+cloud shape as an empty shell" step has no dedicated verb — `list` + `pull` cover
+it, and the grouping dirs fall out of the pull.
+
+**`new` never marks.** It yields a markerless grouping dir; a folder becomes a
+*unit* only when content flows through it (`pull`/`push`). The delete verbs split
+on which side they destroy:
 
 | Verb | exists on cloud? | effect | cloud |
 |---|---|---|---|
-| `ferry stub <name>` | **must** — errors if not | mirror an existing cloud folder as an empty local shell ("browse, then pull") | read-only |
 | `ferry new <name>` | must **not** | create a brand-new folder, both sides | `rclone mkdir` |
 | `ferry drop <dir>` | — | delete **local only** — presence control; cloud retains | untouched |
 | `ferry rm <dir>` | — | delete **both sides** — confirmation-gated; recovery depends on the remote's trash/versioning | `rclone purge` |
 
-`stub` / `new` / `pull <sub>` are refused inside a unit's subtree — you are
-already in materialized content, there is nothing to fetch or place. `drop` and
-`rm` are kept distinct deliberately: local presence control is not cloud
-retention, and the two must never collapse into one ambiguous delete.
+`new` / `pull <sub>` are refused inside a unit's subtree — you are already in
+materialized content, there is nothing to fetch or place. `drop` and `rm` are
+kept distinct deliberately: local presence control is not cloud retention, and
+the two must never collapse into one ambiguous delete.
 
 ### No-arg walk
 
-`push`/`pull` with no `<dir>` walk **down** from `$PWD` and act on every unit —
-a `.ferry` with no `.ferry` descendant. Each yields `(localdir, remote)` by
-derivation, run through the same single-unit path; stubs (no marker) and grouping
-roots (non-leaf markers) are skipped. Because units are an antichain, no node is
-ever both walked-as-parent and walked-as-child, so no bytes transfer twice.
+`status` and `push`/`pull` with no `<dir>` walk **down** from `$PWD` and act on
+every unit — an **empty** `.ferry` with no `.ferry` descendant. Each yields
+`(localdir, remote)` by derivation, run through the same single-unit path;
+markerless grouping dirs and the root's content marker (`find … -empty` excludes
+it) are skipped. Because units are an antichain, no node is ever both
+walked-as-parent and walked-as-child, so no bytes transfer twice.
 
 **Transfers stay additive** (`rclone copy`); `--mirror` (`rclone sync`,
 deletions propagate) is an explicit, single-unit-only opt-in. A failed unit in a
@@ -154,7 +163,7 @@ over it. `mv` carries it to the new path; `drop`/`rm` delete it.
 | File | Written by | Read by | Meaning |
 |---|---|---|---|
 | `synced_at` | `push`/`pull` (`mark_synced`) | the prompt | empty file; its **mtime** is the last sync — the baseline the working tree is compared against |
-| `remote` | `status` (`record_remote`) | the prompt | `sync`/`behind` + timestamp — whether the cloud was ahead at the last check |
+| `remote` | `status` (`probe_unit`) | the prompt | `sync`/`behind` + timestamp — whether the cloud was ahead at the last check |
 
 The prompt (`__ferry_ps1` in `ferry-prompt.sh`) renders `= > < <> ?` from these:
 
@@ -167,7 +176,7 @@ The prompt (`__ferry_ps1` in `ferry-prompt.sh`) renders `= > < <> ?` from these:
   baseline. `bundle_git` writes `history.bundle` *before* `mark_synced`, so the
   bundle never reads as a pending change.
 - **Cloud side (`<`)** — only as fresh as the last `ferry status`, exactly as
-  git's `<` is only as fresh as the last `git fetch`. `record_remote` does a
+  git's `<` is only as fresh as the last `git fetch`. `probe_unit` does a
   one-way `rclone check` (remote → local, ignoring local-only files) to set the
   bit. A bit older than a day is rendered with a trailing `?` so `=` never
   silently claims sync with a cloud that hasn't been checked.
@@ -307,9 +316,10 @@ does not use git.
 
 ## Operational rules
 
-- A **unit** is a leaf `.ferry`; units form an antichain and there is exactly one
-  (content-bearing) root per tree. Discovery is walk-up (root/base) + walk-down
-  (`find . -name .ferry`, leaves only).
+- A **unit** is a leaf **empty** `.ferry`; units form an antichain and there is
+  exactly one (content-bearing) root per tree. Discovery is walk-up (root/base) +
+  walk-down (`find . -name .ferry -empty`, leaves only) — `-empty` keeps the
+  root's content marker from ever being treated as a unit.
 - The remote path is **derived** (`base + path-under-root`), stored only at the
   root — never per node.
 - Transfers are additive (`rclone copy`) by default; mirroring (`rclone sync`)
@@ -320,9 +330,10 @@ does not use git.
 - `.git/` and `.ferry` are **always** excluded from transfers (`--exclude`).
 - `ferry push` on a git project writes the bundle to a temp name and
   **atomically renames** it before pushing.
-- Creation never marks: `stub`/`new` make markerless grouping dirs; only
-  `pull`/`push` confer unit status. `stub` requires the cloud folder to exist;
-  `new` requires it not to.
+- Creation never marks: `new` makes a markerless grouping dir; only `pull`/`push`
+  confer unit status. Browsing an existing cloud folder needs no verb — `list`
+  takes a path and `pull` materializes it. `new` requires the cloud folder not to
+  exist.
 - `ferry drop` is local-only; `ferry rm` deletes both sides (confirmation-gated).
   The remote's version history + trash (where available) is the recovery backstop.
 - Per-machine sync state lives in `${XDG_CACHE_HOME:-~/.cache}/ferry`, never in the
