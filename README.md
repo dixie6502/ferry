@@ -29,7 +29,7 @@ never spell out both sides, and a rename recomputes everything beneath it for fr
 
 ## Setup
 
-Requires `bash`, `git`, `jq`, and `rclone` with a remote configured.
+Requires `bash`, `git`, and `rclone` with a remote configured.
 
 Configure the remote once, in rclone itself:
 

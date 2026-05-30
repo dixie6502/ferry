@@ -26,7 +26,7 @@
 #
 # Flags: --mirror (propagate deletions, single <dir> only), -y/--yes (skip prompts).
 #
-# Requires: bash, rclone (with the remote configured), git, jq.
+# Requires: bash, rclone (with the remote configured), git.
 
 set -euo pipefail
 
@@ -44,8 +44,7 @@ readonly XFER_EXCLUDE=(--exclude '.git/**' --exclude "$MARKER")
 # --- helpers ----------------------------------------------------------------
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 
-require_rclone() { command -v rclone >/dev/null || die "rclone not found"; }
-require_jq()     { command -v jq >/dev/null     || die "jq not found"; }
+require() { command -v "$1" >/dev/null || die "$1 not found"; }
 
 # Reject absolute paths and '..' traversal in a user-supplied name.
 validate_name() {
@@ -294,15 +293,11 @@ cmd_init() {
 }
 
 cmd_list() {
-    require_rclone; require_jq
-    find_root
-    rclone lsjson --dirs-only "$(remote_of "$(resolve_target "${1:-}")")" \
-        | jq -r 'sort_by(.Name)[] | "\(.ModTime[0:19] | sub("T"; " "))  \(.Name)"'
+    rclone lsf --dirs-only --format "tp" --separator '  ' \
+        "$(remote_of "$(resolve_target "${1:-}")")" | sort -k3
 }
 
 cmd_status() {
-    require_rclone
-    find_root
     local target; target=$(unit_target "${1:-}")
     record_remote "$target"
     rclone check "${XFER_EXCLUDE[@]}" "$target" "$(remote_of "$target")"
@@ -310,8 +305,6 @@ cmd_status() {
 
 cmd_stub() {
     local name=${1:-}; [ -n "$name" ] || die "usage: $PROG stub <name>"
-    require_rclone
-    find_root
     local target; target=$(resolve_target "$name")
     refuse_in_unit "$target"
     [ -e "$target" ] && die "already exists: $target"
@@ -323,8 +316,6 @@ cmd_stub() {
 
 cmd_new() {
     local name=${1:-}; [ -n "$name" ] || die "usage: $PROG new <name>"
-    require_rclone
-    find_root
     local target; target=$(resolve_target "$name")
     refuse_in_unit "$target"
     [ -e "$target" ] && die "already exists: $target"
@@ -337,8 +328,6 @@ cmd_new() {
 
 cmd_pull() {
     local mirror=$1 arg=${2:-}
-    require_rclone
-    find_root
     if [ -n "$arg" ]; then
         local target; target=$(resolve_target "$arg")
         is_unit "$target" || refuse_in_unit "$target"   # new unit must not nest in one
@@ -351,8 +340,6 @@ cmd_pull() {
 
 cmd_push() {
     local mirror=$1 arg=${2:-}
-    require_rclone
-    find_root
     if [ -n "$arg" ]; then
         local target; target=$(resolve_target "$arg")
         [ -d "$target" ] || die "no local dir: $target"
@@ -369,8 +356,6 @@ cmd_push() {
 
 cmd_drop() {
     local yes=$1 arg=${2:-}
-    require_rclone
-    find_root
     local target; target=$(unit_target "$arg")
     refuse_cwd_inside "$target"
     local spec; spec=$(spec_of "$target")
@@ -386,8 +371,6 @@ cmd_drop() {
 cmd_rm() {
     local yes=$1 arg=${2:-}
     [ -n "$arg" ] || die "usage: $PROG rm <dir>"
-    require_rclone
-    find_root
     local target; target=$(resolve_target "$arg")
     refuse_cwd_inside "$target"
     local rp spec; rp=$(remote_of "$target"); spec=$(spec_of "$target")
@@ -405,8 +388,6 @@ cmd_mv() {
     local old=${1:-} new=${2:-}
     { [ -n "$old" ] && [ -n "$new" ]; } || die "usage: $PROG mv <old> <new>"
     validate_name "$old"; validate_name "$new"
-    require_rclone
-    find_root
     local old_abs new_abs; old_abs=$(resolve_target "$old"); new_abs=$(resolve_target "$new")
     refuse_cwd_inside "$old_abs"
     [ -e "$new_abs" ] && die "local target exists: $new_abs"
@@ -426,7 +407,7 @@ cmd_mv() {
 }
 
 usage() {
-    sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR<3{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
     exit "${1:-0}"
 }
 
@@ -445,6 +426,12 @@ main() {
         esac
     done
     set -- "${args[@]+"${args[@]}"}"
+
+    # Every verb but init talks to the cloud from inside an existing tree.
+    case "$verb" in
+        init|help|-h|--help) ;;
+        *) require rclone; find_root ;;
+    esac
 
     case "$verb" in
         init)   cmd_init "${1:-}" ;;
