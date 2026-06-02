@@ -89,6 +89,23 @@ and differ on which side they destroy:
 | `ferry drop <dir>`  | — | delete the **local** unit; the cloud retains it |
 | `ferry rm <dir>`    | — | delete a **unit** both sides (asks first; recovery depends on the remote's trash/versioning) |
 
+**Adopting an existing folder** that already holds files — say one you moved in
+from outside the tree — needs no `new`. `push` does not require the remote prefix
+to exist (unlike `pull`, which downloads): it `rclone copy`s the files up,
+creating the cloud path from scratch, then writes the marker so the folder
+becomes a unit. So just move the folder under the root and push it by name:
+
+```sh
+mv ~/my-folder ~/Projects/my-folder   # bring it under the root
+cd ~/Projects
+ferry push my-folder                  # uploads, creates the cloud prefix, marks it a unit
+```
+
+Name the folder **explicitly** on this first push — a no-arg `ferry push` walk
+only finds existing units (empty markers), so a markerless folder is skipped
+until its first push gives it one. (`new` is for brand-new names and refuses a
+folder that already exists locally or on the cloud; adoption goes through `push`.)
+
 `new`/`pull <sub>` are refused inside an already-materialized unit. `drop`
 (presence control) and `rm` (cloud retention) are deliberately separate verbs.
 `rm` refuses anything that is not a local unit — to delete a cloud-only folder,
