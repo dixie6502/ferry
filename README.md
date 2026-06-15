@@ -150,6 +150,19 @@ ferry drop CL03-Initech/site        # free local disk; cloud keeps it
 ferry mv CL03-Initech CL03-Init     # rename a grouping dir (cloud, then local)
 ```
 
+## Shell completion
+
+`ferry` self-emits a bash completion script — install it by evaluating the
+output of `ferry completion bash` from your shell rc (the `fzf --bash` model):
+
+```sh
+# ~/.bashrc
+eval "$(ferry completion bash)"
+```
+
+It completes verbs, each verb's accepted flags (`--mirror` on `pull`/`push`,
+`-y`/`--yes` on `drop`/`rm`), and directory arguments. Only bash is supported.
+
 ## Prompt indicator
 
 `ferry-prompt.sh` adds a git-prompt-style drift indicator to your shell prompt,

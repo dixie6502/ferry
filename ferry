@@ -24,6 +24,7 @@
 #   ferry mv <old> <new>  rename/move a unit or grouping dir (cloud first, then local)
 #   ferry drop [<dir>]    delete LOCAL only; the cloud keeps its copy
 #   ferry rm   <dir>      delete a unit BOTH sides (confirmation-gated)
+#   ferry completion bash emit a bash completion script (eval from your shell rc)
 #
 # Flags: --mirror (propagate deletions, single <dir> only), -y/--yes (skip prompts).
 #
@@ -429,6 +430,52 @@ cmd_mv() {
     if [ -d "$so" ]; then rm -rf "$sn"; mkdir -p "$(dirname "$sn")"; mv "$so" "$sn"; fi
 }
 
+# Emit a bash completion script for ferry; install with `eval "$(ferry completion bash)"`.
+# Only bash is supported. The prompt indicator stays a separately-sourced file
+# (ferry-prompt.sh), like git's git-prompt.sh vs git-completion.bash.
+cmd_completion() {
+    local shell=${1:-}
+    case "$shell" in
+        bash) ;;
+        '')   die "usage: $PROG completion bash" ;;
+        *)    die "unsupported shell '$shell' (only bash)" ;;
+    esac
+    cat <<'COMPLETION'
+# bash completion for ferry — verbs, verb-specific flags, directory arguments.
+_ferry() {
+    local cur verb flags
+    cur=${COMP_WORDS[COMP_CWORD]}
+
+    # The verb itself.
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W 'init list status pull push new mv drop rm completion help' -- "$cur") )
+        return
+    fi
+    verb=${COMP_WORDS[1]}
+
+    # Flags, offered only for the verbs that accept them.
+    if [ "${cur:0:1}" = - ]; then
+        flags='-h --help'
+        case $verb in
+            pull|push) flags="$flags --mirror" ;;
+            drop|rm)   flags="$flags -y --yes" ;;
+        esac
+        COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+        return
+    fi
+
+    # Positional argument: a shell for `completion`, a directory for the rest.
+    case $verb in
+        completion) COMPREPLY=( $(compgen -W 'bash' -- "$cur") ) ;;
+        list|status|pull|push|new|mv|drop|rm)
+            if declare -F _filedir >/dev/null 2>&1; then _filedir -d
+            else COMPREPLY=( $(compgen -d -- "$cur") ); fi ;;
+    esac
+}
+complete -F _ferry ferry
+COMPLETION
+}
+
 usage() {
     awk 'NR<3{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
     exit "${1:-0}"
@@ -450,9 +497,9 @@ main() {
     done
     set -- "${args[@]+"${args[@]}"}"
 
-    # Every verb but init talks to the cloud from inside an existing tree.
+    # init and completion need neither rclone nor an enclosing tree; the rest do.
     case "$verb" in
-        init|help|-h|--help) ;;
+        init|completion|help|-h|--help) ;;
         *) require rclone; find_root ;;
     esac
 
@@ -466,6 +513,7 @@ main() {
         drop)   cmd_drop "$yes" "${1:-}" ;;
         rm)     cmd_rm "$yes" "${1:-}" ;;
         mv)     cmd_mv "${1:-}" "${2:-}" ;;
+        completion) cmd_completion "${1:-}" ;;
         -h|--help|help) usage 0 ;;
         *)      die "unknown command: $verb (try: $PROG help)" ;;
     esac

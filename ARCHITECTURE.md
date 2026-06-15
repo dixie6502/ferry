@@ -24,7 +24,7 @@ drop it again — alongside a few projects under active editing.
 |---|---|
 | **Cloud remote** | Any rclone-supported backend. Ideally one with file version history + trash, which then serves as the recovery backstop. |
 | **rclone** | The only transfer tool. Stateless, on-demand, single binary. No background daemon. Holds the remote and its credentials in its own config (`rclone config`). |
-| **`ferry`** | Thin shell wrapper over rclone. Markers (`.ferry`) select a sparse local mirror; verbs pull/push units, manage tree structure, and snapshot git history. |
+| **`ferry`** | Thin shell wrapper over rclone. Markers (`.ferry`) select a sparse local mirror; verbs pull/push units, manage tree structure, and snapshot git history. Also self-emits its bash completion (`ferry completion bash`). |
 | **`ferry-prompt.sh`** | Optional sourced shell function (`__ferry_ps1`) drawing a git-prompt-style drift indicator from the per-machine sync state `ferry` records. |
 
 ## Layout
@@ -102,6 +102,7 @@ leaf marker sits.
 | `ferry pull [<dir>]` | `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent grouping dirs. No arg → walk units under `$PWD`. |
 | `ferry push [<dir>]` | bundle git, then `rclone copy local→remote`, write marker | Send a unit up; confers unit status on a fresh dir. No arg → walk units under `$PWD`. |
 | `ferry mv <old> <new>` | `rclone moveto`, then `mv` local | Rename/move a unit or grouping dir, cloud-first. |
+| `ferry completion bash` | — (prints to stdout) | Emit a bash completion script; install with `eval "$(ferry completion bash)"`. Needs no tree or rclone. |
 
 ### Browse, create & delete
 
