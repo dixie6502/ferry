@@ -214,6 +214,7 @@ depth. The local side (`>`) is computed offline on every prompt with a single
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
 ## ToDo before going public
+- [x] Bash shell completion (`ferry completion bash`)
 - [ ] Review all code
 - [ ] Optional flag for the rclone remote with a global env variable for a
   default (the remote is currently single-sourced from the root `.ferry`)
