@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Run every ferry test suite. Exits non-zero if any assertion failed.
+#
+# The suites drive the real `ferry` script against a real rclone backend: the
+# cloud side is a plain directory addressed as `:local:<path>`, an rclone
+# connection string. Nothing is mocked, XDG_CACHE_HOME is redirected into the
+# sandbox so the real ~/.cache/ferry is untouched, and no configured remote is
+# reachable from the tests.
+#
+# Scratch trees are built under tmp/ (gitignored) and reset by each suite.
+#
+# Usage: tests/run            (from anywhere)
+#        tests/run drift      (one suite: drift | guard | resolve)
+
+set -uo pipefail
+
+readonly HERE=$(cd "$(dirname "$0")" && pwd -P)
+readonly SUITES=(drift guard resolve)
+
+command -v rclone >/dev/null || { printf 'tests: rclone not found\n' >&2; exit 1; }
+
+failed=0
+for suite in "${@:-${SUITES[@]}}"; do
+    script=$HERE/test-$suite.sh
+    [ -f "$script" ] || { printf 'tests: no such suite: %s\n' "$suite" >&2; exit 1; }
+
+    printf '\n=== %s ===\n' "$suite"
+    if bash "$script"; then :; else failed=$((failed + 1)); fi
+done
+
+printf '\n'
+if [ "$failed" -gt 0 ]; then
+    printf 'tests: %d suite(s) failed\n' "$failed" >&2
+    exit 1
+fi
+printf 'tests: all suites passed\n'

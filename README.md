@@ -266,6 +266,25 @@ depth. The local side (`>`) is computed offline on every prompt with a single
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
+## Tests
+
+```sh
+tests/run              # every suite
+tests/run drift        # one of: drift | guard | resolve
+```
+
+They drive the real `ferry` script against a **real rclone backend** — the cloud
+side is a plain directory addressed as `:local:<path>`, an rclone connection
+string. Nothing is mocked; `XDG_CACHE_HOME` is redirected into the sandbox so
+your own `~/.cache/ferry` is untouched, and no configured remote is reachable
+from them. Scratch trees are built under `tmp/` and reset by each suite.
+
+| Suite | Covers |
+| --- | --- |
+| `drift` | classification: edits, adds, deletes, one-sided files, the sync manifest, an unreadable cloud, whitespace in paths, prompt agreement |
+| `guard` | which transfers are refused and which stay frictionless, `--mirror`, `--force`, walks |
+| `resolve` | staging the cloud's side, the git merge-base hint, stale staging, filenames rclone would otherwise drop |
+
 ## ToDo before going public
 - [x] Bash shell completion (`ferry completion bash`)
 - [ ] Review all code
