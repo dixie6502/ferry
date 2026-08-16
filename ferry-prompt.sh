@@ -22,7 +22,7 @@
 #     when clean (no early exit). Both are acceptable for a prompt.
 #
 #   * The cloud side ('<') is only as fresh as your last `ferry status`, which
-#     records a 'sync'/'behind' bit — exactly as git's '<' is only as fresh as
+#     records a 'sync'/'behind'/'diverged' bit — exactly as git's '<' is only as fresh as
 #     your last `git fetch`. A stale bit gets a trailing '?' once it is older
 #     than FERRY_PS1_STALE seconds (default 86400 = 1 day; 0 disables the check),
 #     so an '=' never silently lies about a cloud you have not checked lately.
@@ -80,8 +80,21 @@ __ferry_ps1() {
         unit=$root
     fi
 
+    # Keyed by the remote base as well as the unit path, exactly as `ferry` keys
+    # it: two trees can hold the same unit name against different remotes. The
+    # percent-encoding must match `ferry`'s state_key — it is injective, where a
+    # plain substitution would map two different bases onto one directory.
     local spec=${unit#"$root"}; spec=${spec#/}
-    local sd=$FERRY_STATE_ROOT${spec:+/$spec}
+    local base key='' i c
+    base=$(head -1 "$root/$FERRY_MARKER")
+    for (( i = 0; i < ${#base}; i++ )); do
+        c=${base:i:1}
+        case $c in
+            [A-Za-z0-9._-]) key+=$c ;;
+            *) printf -v c '%%%02X' "'$c"; key+=$c ;;
+        esac
+    done
+    local sd=$FERRY_STATE_ROOT/$key${spec:+/$spec}
     local marker=$sd/synced_at
 
     # No baseline yet (never pushed/pulled from here) → unknown.
@@ -94,9 +107,15 @@ __ferry_ps1() {
     ahead=$(__ferry_ps1_local_changed "$unit" "$marker")
 
     # Cloud bit from the last `ferry status` (written alongside the marker).
+    # 'diverged' also forces the local half: `ferry status` compares content and
+    # can see a conflict — two sides edited to different bytes with mtimes older
+    # than the baseline — that this function's mtime walk never would.
     if [ -r "$sd/remote" ]; then
         read -r rstate rtime < "$sd/remote"
-        [ "$rstate" = behind ] && behind='<'
+        case $rstate in
+            behind)   behind='<' ;;
+            diverged) behind='<'; ahead='>' ;;
+        esac
     fi
 
     local sym

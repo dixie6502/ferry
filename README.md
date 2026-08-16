@@ -56,6 +56,7 @@ ferry init Remote:Projects   # writes ~/Projects/.ferry
 ferry init <base>       make $PWD a root holding <base> (no nested roots)
 ferry list  [<dir>]     list a node's children on the remote (no local dir needed)
 ferry status [<dir>]    drift for every unit at/under $PWD (the "fetch")
+ferry resolve [<dir>]   stage the cloud side of a conflict, to compare by hand
 ferry pull  [<dir>]     materialize a unit; no arg → every unit under $PWD
 ferry push  [<dir>]     send a unit up;     no arg → every unit under $PWD
 ferry new   <name>      start a brand-new unit (cloud prefix appears on first push)
@@ -120,7 +121,59 @@ copy is idempotent, so re-running resumes), ending with an `ok/total` tally.
 - `--mirror` — propagate deletions (`rclone sync`) instead of the additive
   default (`rclone copy`). **Single `<dir>` only** — refused on a walk, where an
   interrupted deletion-sync is unsafe.
+- `--force` — skip the drift guard below (and the probe it costs).
 - `-y` — skip confirmation prompts (`drop`, `rm`).
+
+### Diverged units
+
+`push` and `pull` check drift first and refuse to run when the transfer would
+**overwrite** what the other side changed — the same thing git does with a
+non-fast-forward push. An `rclone copy` overwrites the far side whenever the two
+differ, newer or not, so a pull over an unpushed edit would destroy it.
+
+Only files that exist on *both* sides can be overwritten, so one-sided changes
+never stand in the way: deleting a file locally and then pulling just brings it
+back, and an unpushed new file is not on the remote at all. `--mirror` is
+stricter — it deletes on the far side, so it is refused unless the drift points
+its way.
+
+```
+$ ferry status CL03-Initech/site
+<>  CL03-Initech/site
+    both   edit   notes.md
+    remote add    refs.bib
+
+$ ferry push CL03-Initech/site
+ferry: refusing to push CL03-Initech/site — diverged: both sides changed since the last sync
+    notes.md
+ferry: inspect it with 'ferry resolve', or override with --force
+```
+
+A unit whose cloud side could not be read (`?`) is refused too — an unanswered
+question is not a green light. On a no-arg walk the blocked unit is tallied as a
+failure and the others still transfer.
+
+`ferry resolve` then puts the cloud's version of each conflicting file where you
+can diff it — **outside** the unit, in ferry's own state dir, so it never rides
+back up and `drop`/`rm` take it away with the unit:
+
+```
+$ ferry resolve CL03-Initech/site
+ferry: the cloud version of 2 file(s) is in
+  ~/.cache/ferry/<remote>/CL03-Initech/site/conflict
+    notes.md   (changed on both sides)
+    refs.bib   (added on the cloud)
+ferry: reconcile in place, then 'ferry push --force' to publish your result
+```
+
+It stages everything the cloud touched, not just the files both sides changed —
+the ones only *you* changed are already in hand. ferry does **not** merge: it has
+no third version to merge against, so it makes the other one available and leaves
+the choice to you. The final `push` needs `--force`, because a merged file
+matches neither side and the guard still sees a conflict until you say so. On a git unit it goes one
+step further: the cloud's `history.bundle` is staged too, and the two histories
+do share a merge base, so the printed `git fetch` gives you the other side as
+branches to merge normally.
 
 ### Example
 
