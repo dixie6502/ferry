@@ -57,6 +57,7 @@ ferry init <base>       make $PWD a root holding <base> (no nested roots)
 ferry list  [<dir>]     list a node's children on the remote (no local dir needed)
 ferry status [<dir>]    drift for every unit at/under $PWD (the "fetch")
 ferry resolve [<dir>]   stage the cloud side of a conflict, to compare by hand
+ferry sync  [<dir>]     converge a unit both ways; no arg → every unit under $PWD
 ferry pull  [<dir>]     materialize a unit; no arg → every unit under $PWD
 ferry push  [<dir>]     send a unit up;     no arg → every unit under $PWD
 ferry new   <name>      start a brand-new unit (cloud prefix appears on first push)
@@ -112,11 +113,23 @@ folder that already exists locally or on the cloud; adoption goes through `push`
 `rm` refuses anything that is not a local unit — to delete a cloud-only folder,
 or a whole grouping subtree, use `rclone` directly.
 
+### Everyday syncing
+
+`ferry sync` is the daily verb: it reads the same per-file drift `status` shows
+and carries each side's changes to the other in one run — your edits up, the
+cloud's down. It is additive both ways, toward the **union**: a deleted file
+comes back from the other side rather than taking the other copy with it
+(deletions propagate only via `push --mirror`/`pull --mirror`). A file changed
+on *both* sides moves in neither direction — sync converges everything safe,
+lists the conflicts, and points at `resolve`. `push` and `pull` remain for the
+directional cases: first publish, first materialize, and `--force`.
+
 ### No-arg walk & flags
 
-`ferry pull` / `ferry push` with no argument walk **down** from `$PWD` and act on
-every unit found. A unit that fails is recorded and the run continues (additive
-copy is idempotent, so re-running resumes), ending with an `ok/total` tally.
+`ferry sync` / `ferry pull` / `ferry push` with no argument walk **down** from
+`$PWD` and act on every unit found. A unit that fails is recorded and the run
+continues (additive copy is idempotent, so re-running resumes), ending with an
+`ok/total` tally.
 
 - `--mirror` — propagate deletions (`rclone sync`) instead of the additive
   default (`rclone copy`). **Single `<dir>` only** — refused on a walk, where an
@@ -284,6 +297,7 @@ from them. Scratch trees are built under `tmp/` and reset by each suite.
 | `drift` | classification: edits, adds, deletes, one-sided files, the sync manifest, an unreadable cloud, whitespace in paths, prompt agreement |
 | `guard` | which transfers are refused and which stay frictionless, `--mirror`, `--force`, walks |
 | `resolve` | staging the cloud's side, the git merge-base hint, stale staging, filenames rclone would otherwise drop |
+| `sync` | both directions in one run, deletions restored (union), conflicts left in place and still resolvable, walks |
 
 ## ToDo before going public
 - [x] Bash shell completion (`ferry completion bash`)

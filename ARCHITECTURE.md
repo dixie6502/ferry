@@ -87,6 +87,13 @@ is mature, supports a wide range of backends, and gives a true drift check
 side. Mirroring (`rclone sync`, where deletions propagate) is an explicit,
 per-command opt-in — so a local delete never reaches the cloud unless asked.
 
+**Transfers compare by checksum** (`--checksum`, whenever the remote maintains
+hashes): rclone's default skip rule is size+modtime, under which a same-size
+preserved-mtime edit stays untransferred — while `mark_synced` would record its
+hash as the shared ancestor over content that never crossed, arming a later
+guard-approved transfer to overwrite the unseen edit. With `--checksum`,
+"skipped" means "identical", which is exactly what the manifest records.
+
 ## `ferry` verbs
 
 The whole model is two tree walks: **up** to the root for the base, **down** to
@@ -98,10 +105,11 @@ leaf marker sits.
 |---|---|---|
 | `ferry init <base>` | — (writes `.ferry`) | Make `$PWD` a root holding `<base>`. Refused inside an existing tree (no nested roots). |
 | `ferry list [<dir>]` | `rclone lsf --dirs-only --format tp` of `remote_of(dir)` | Remote children of a node (or the root); modtime + name, sorted by name. |
-| `ferry status [<dir>]` | one `rclone check --combined` + one `rclone lsf --max-age` per unit, or neither if the remote prefix is absent (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; for a single unit, also the per-file `local / remote / both` classification (see [Drift classification](#drift-classification)). Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
+| `ferry status [<dir>]` | one `rclone check --combined` + one hash listing (`rclone lsf --format thp`) per unit, or neither if the remote prefix is absent (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; for a single unit, also the per-file `local / remote / both` classification (see [Drift classification](#drift-classification)). Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
 | `ferry pull [<dir>]` | guard, then `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent grouping dirs. No arg → walk units under `$PWD`. Refused on a diverged unit (see [Transfer guard](#transfer-guard)). |
 | `ferry push [<dir>]` | guard, bundle git, then `rclone copy local→remote`, write marker | Send a unit up; confers unit status on a fresh dir. No arg → walk units under `$PWD`. Refused on a diverged unit (see [Transfer guard](#transfer-guard)). |
 | `ferry resolve [<dir>]` | `rclone copy --files-from` of the conflicting paths into the unit's state dir | Stage the cloud side of a `<>` so it can be compared with ordinary tools. Never merges, never writes into the unit (see [Transfer guard](#transfer-guard)). |
+| `ferry sync [<dir>]` | probe, then two `rclone copy --files-from-raw` runs (one per direction) | Converge a unit with the cloud in one run: each side's changes cross to the other, conflicts stay put. No arg → walk units under `$PWD` (see [Converging](#converging-sync)). |
 | `ferry mv <old> <new>` | `rclone moveto`, then `mv` local | Rename/move a unit or grouping dir, cloud-first. |
 | `ferry completion bash` | — (prints to stdout) | Emit a bash completion script; install with `eval "$(ferry completion bash)"`. Needs no tree or rclone. |
 
@@ -213,70 +221,94 @@ it" — a plain modification fails a check in *both* directions and reads as
 divergence. That made `<>` fire on the ordinary edit-then-push cycle, which is
 precisely the state it is supposed to warn about.
 
-Direction is therefore taken **relative to the last-sync baseline**, the role
-git's merge base plays. `synced_at` already records it per unit, and rclone
-preserves source mtimes on transfer, so straight after a sync every file on both
-sides is older than the baseline and only genuine post-sync edits stand out.
+Direction is therefore taken **relative to the last sync** — the role git's
+merge base plays. The manifest records that sync's ancestors: every path the
+two sides shared, with its content hash at that moment (`#ferry v2 <hashtype>`
+header, then `<hash> <path>` lines, hashed with the remote's preferred
+algorithm as rclone reports it — blake3 on Filen, md5 on Drive or S3-alikes).
+A side changed a file iff its current hash differs from the recorded ancestor.
+Mtimes carry no weight here, which makes the attribution immune to the lies
+transfers preserve: a file edited on another machine before our baseline and
+pushed after it arrives with a pre-baseline mtime, yet its hash still differs
+from the ancestor — a cloud change, not silence.
 
-`classify_unit` runs one content check (*which* files differ) and one listing per
-side (*which* files moved since the baseline), then labels each differing file:
+`classify_unit` runs one content check (*which* files differ: `rclone check
+--combined`) and one remote listing (`rclone lsf --format thp`: each cloud
+file's mtime and current hash), hashes the flagged local files (`rclone
+hashsum` over only those — never the whole unit), then labels each differing
+file:
 
-| `rclone check --combined` | moved locally | moved on the cloud | class |
+| `rclone check --combined` | changed here | changed there | class |
 |---|---|---|---|
 | `*` on both sides, differ | ✓ | ✓ | `both` |
 | `*` | ✓ | — | `local` |
 | `*` | — | ✓ | `remote` |
-| `*` | — | — | `both` (ambiguous — clock skew) |
+| `*` | — | — | `both` (unattributable) |
 | `!` unreadable | — | — | `both` (what is unknown blocks) |
+
+**Fallback.** Where a hash is missing — a manifest written before hashes
+existed (v1: bare paths, no header), or an entry the backend holds no hash for
+(e.g. multipart objects whose ETag is no MD5) — "changed" falls back to that
+side's mtime relative to the baseline (`synced_at`). rclone preserves source
+mtimes on transfer, so right after a sync both sides predate the baseline and
+only later writes stand out. The fallback inherits the trade-offs the hashes
+remove: a preserved-mtime edit (`cp -p`, a late push from another machine) is
+attributed conservatively or not at all, and clock skew between machines can
+misread direction. A v1 manifest therefore degrades rather than breaks —
+membership attribution stays exact, content attribution turns heuristic, and
+the next push/pull rewrites it as v2.
 
 Every line also carries a **shape** — `edit` for a file present on both sides,
 `add` or `delete` for one present on a single side. The side says whose change it
 is; the shape says what a transfer could do to it, which is what the
 [transfer guard](#transfer-guard) acts on.
 
-A file present on only one side is not an mtime question at all — whether it
-*left* one side or *arrived* on the other is invisible in any mtime — so it is
-answered from the **manifest**, the set of paths present on both sides at the
-last sync:
+A file present on only one side is not a content question alone — whether it
+*left* one side or *arrived* on the other is invisible in anything the
+surviving copy carries — so presence is answered from the **manifest's
+membership**, the set of paths present on both sides at the last sync:
 
 | `rclone check --combined` | in the manifest | class |
 |---|---|---|
 | `+` only local | — | `local` (not shared last sync: added here, or never pushed) |
-| `+` | ✓, and moved here | `both` (changed here, dropped there) |
+| `+` | ✓, and changed here | `both` (edited here, dropped there) |
 | `+` | ✓ | `remote` (the cloud dropped it) |
 | `-` only on the cloud | — | `remote` (never here: it arrived there) |
-| `-` | ✓, and moved there | `both` (deleted here, changed there) |
+| `-` | ✓, and changed there | `both` (deleted here, changed there) |
 | `-` | ✓ | `local` (deleted here) |
 
-Both one-sided branches consult the mtime as well as the manifest, and for the
-same reason: a file the far side dropped *and* this side edited is a conflict,
-not a clean deletion, and letting it read as a plain one-way change is enough for
-a `--mirror` in that direction to erase the surviving edit.
+Both one-sided branches also ask whether the surviving copy changed since the
+sync (its hash against the ancestor's, with the same mtime fallback), and for
+the same reason: a file the far side dropped *and* this side edited is a
+conflict, not a clean deletion, and letting it read as a plain one-way change
+is enough for a `--mirror` in that direction to erase the surviving edit.
 
-Guessing this from mtimes instead is what makes a file pushed late from another
-machine (created Monday, pushed Friday, our baseline Wednesday) look like a local
-deletion — and `--mirror` would then delete it from the cloud. A directory's
-mtime is no substitute: it is stamped by *any* add or remove, so one unrelated
-local file forges the verdict for every remote-only file beside it, and a
-directory deleted wholesale leaves no stamp to read at all.
+Guessing presence from mtimes instead is what makes a file pushed late from
+another machine (created Monday, pushed Friday, our baseline Wednesday) look
+like a local deletion — and `--mirror` would then delete it from the cloud. A
+directory's mtime is no substitute: it is stamped by *any* add or remove, so
+one unrelated local file forges the verdict for every remote-only file beside
+it, and a directory deleted wholesale leaves no stamp to read at all.
 
 Which side the manifest is read from follows from the transfer, and reading the
 wrong one would over-count files the other side never had: an additive `push`
 leaves local ⊆ cloud, so the local file list *is* the intersection; an additive
 `pull` leaves cloud ⊆ local, so the cloud listing is.
 
-**When** it is read matters as much as which side. The manifest is captured
-*before* the transfer and installed only once it succeeds: taken afterwards it
-would enrol a file written during the transfer, which never crossed. The baseline
-is stamped at completion, because the sync's own writes land after the start —
-the marker, a restored `.git`, and, on a backend that cannot set a destination
-modtime, the transferred objects themselves — and would otherwise read as
-post-sync changes (`status` would say `<>` and the prompt `>` on a tree that had
-just synced cleanly). The pair covers both halves without conflict: a file
-written mid-transfer is absent from the manifest, so it is attributed from that
-rather than from its mtime. A side that cannot be listed fails the transfer
-rather than recording an empty ancestor set, which would silently invert every
-later deletion into "added on the other side".
+**When** it is read matters as much as which side. The manifest's paths are
+captured *before* the transfer and installed only once it succeeds: taken
+afterwards they would enrol a file written during the transfer, which never
+crossed. The hashes cost nothing extra: a `pull` reads them off the same remote
+listing that supplies the paths, and a `push` reads them *after* the transfer
+from the remote's metadata — every pre-listed path then holds the pushed
+content on both sides, so no local file is ever hashed at sync time. The
+baseline is stamped at completion, because the sync's own writes land after the
+start — the marker, a restored `.git`, and, on a backend that cannot set a
+destination modtime, the transferred objects themselves — and would otherwise
+read as post-sync changes in the mtime fallback (`status` would say `<>` and
+the prompt `>` on a tree that had just synced cleanly). A side that cannot be
+listed fails the transfer rather than recording an empty ancestor set, which
+would silently invert every later deletion into "added on the other side".
 
 "Not in the manifest" means *not shared at the last sync* — which covers a file
 added here, one never pushed, and one the far side had already removed. It does
@@ -301,19 +333,20 @@ exits 1 both for "differences found" and for trouble, and downgrades a directory
 it could not list to a stderr tally *while still reporting that whole subtree as
 missing on the far side* — a forged presence change. Its error counter tallies
 each difference plus each real failure, so an excess over the difference count is
-the signal that something went unread. On `?` the stored bit and its timestamp
-are left alone, so the prompt's staleness marker does its job instead of a fresh
-`sync` being written over an unanswered question.
+the signal that something went unread. A summary those counters cannot be
+parsed from is itself treated as trouble — the gate fails closed rather than
+letting a reworded rclone message silently disarm it. On `?` the stored bit and
+its timestamp are left alone, so the prompt's staleness marker does its job
+instead of a fresh `sync` being written over an unanswered question.
 
-Deliberate limits: for a file present on *both* sides, mtime is still a proxy for
-a real ancestor, so it inherits git's stat-cache trade-off (a bare `touch` reads
-as a change) and is sensitive to clock skew between machines — which is why
-"differs but neither side moved" is reported `both` rather than guessed. The
-cutoff passed to `--max-age` carries nanoseconds: truncating it to the second
-would catch files written *during* the sync that set the baseline, and report
-them as cloud changes. And because plain `copy` never propagates deletions, a
-deleted file keeps its side marked drifted until a `--mirror` run reconciles it —
-the sides genuinely differ, and saying so is correct even though a plain `push`
+Deliberate limits: a file that differs while *neither* side's hash differs from
+the ancestor cannot happen honestly, so it is reported `both` rather than
+guessed. The mtime fallback keeps its own precision rule: the cutoff carries
+nanoseconds (`lsf --time-format max`), because truncated to the second it would
+catch files written *during* the sync that set the baseline and report them as
+cloud changes. And because plain `copy` never propagates deletions, a deleted
+file keeps its side marked drifted until a `--mirror` run reconciles it — the
+sides genuinely differ, and saying so is correct even though a plain `push`
 cannot clear it.
 
 ## Transfer guard
@@ -387,6 +420,47 @@ aborting. It costs one probe per unit, which is why `--force` skips the probe as
 well as the block. `drop` uses the same classifier for its unpushed-changes
 warning: with two one-way checks it warned about a file changed *on the cloud*.
 
+## Converging (`sync`)
+
+`sync` is the daily verb: direction comes from the
+[classification](#drift-classification), not from the user, so "make this
+machine and the cloud agree" is one command instead of a `status`-read-symbol-
+type-matching-verb round trip. Per unit it probes, partitions the drift, and
+runs at most two `rclone copy --files-from-raw` transfers — `local` changes up,
+`remote` changes down:
+
+| classified | shape | direction |
+|---|---|---|
+| `local` | edit / add | up |
+| `remote` | edit / add | down |
+| `local` | delete (deleted here) | down — restored from the cloud |
+| `remote` | delete (dropped there) | up — restored to the cloud |
+| `both` | any | **neither** — left in place for `resolve` |
+
+**Sync converges to the union.** It is additive both ways: a deletion on one
+side is restored from the other, never propagated — `push --mirror` /
+`pull --mirror` remain the only deletion paths, exactly as for the directional
+verbs. A conflict blocks only itself: everything safe crosses, the unit exits
+non-zero, and the conflicted paths are listed with a pointer at `resolve`.
+
+Re-baselining with conflicts outstanding needs care in both directions. The
+new manifest is the post-sync remote listing intersected with the pre-transfer
+local paths (plus what came down), so a file that landed on either side *during*
+the sync never enrols as shared. Conflicted paths keep their **previous**
+ancestor line instead of the cloud's current hash — both sides still differ
+from it, so they keep reading `both` across syncs and `resolve` keeps working —
+and the prompt bit is left at `diverged`, not `sync`. Conversely, a sync that
+finds content already equal still refreshes the sync point: after a conflict
+reconciled by hand the ancestors are stale, and the next edit would read `both`
+against them.
+
+Two cases delegate: no cloud prefix yet → first `push`; nothing local to lose →
+plain `pull`. A unit never synced from this machine is refused with the same
+guidance as the guard — direction is unknowable, choose a side with
+`push --force`/`pull --force`. `sync` accepts neither `--mirror` (it has no
+side to delete on) nor `--force` (no side to prefer); after a hand merge the
+published escape remains `push --force`.
+
 ## Sync state & prompt indicator
 
 A `git fetch`/`status` against the live cloud is a network round-trip — too slow
@@ -402,7 +476,7 @@ over it. `mv` carries it to the new path; `drop`/`rm` delete it.
 | File | Written by | Read by | Meaning |
 |---|---|---|---|
 | `synced_at` | `push`/`pull` (`mark_synced`) | the prompt | empty file; its **mtime** is the last sync — the baseline both sides are compared against |
-| `manifest` | `push`/`pull` (`mark_synced`) | `status` | the paths present on **both** sides at that sync — the ancestor set that makes a one-sided file attributable (see [Drift classification](#drift-classification)) |
+| `manifest` | `push`/`pull` (`mark_synced`) | `status` | the paths present on **both** sides at that sync, with their content hash (`#ferry v2 <hashtype>` header) — the ancestor set that attributes one-sided files by membership and edits by hash (see [Drift classification](#drift-classification)) |
 
 The key is `<remote base>/<unit path under the root>`, not the unit path alone:
 two trees on one machine can hold the same unit name against different remotes,
@@ -458,8 +532,10 @@ and a clean large tree is an O(tree) walk per prompt (no early exit), the same
   awkward character — spaces, leading spaces, `#`, `;`, tabs, `*` — round-trips.
 - **Upgrading an existing tree.** A unit synced before the manifest existed has a
   baseline but no manifest, so it reads `<>` and refuses transfers until one
-  `push --force`/`pull --force` re-establishes the sync point. The state
-  directory is a cache; nothing in the tree or on the cloud is affected.
+  `push --force`/`pull --force` re-establishes the sync point. A v1 manifest
+  (paths without hashes) needs nothing: it degrades to mtime attribution and the
+  next sync rewrites it as v2. The state directory is a cache; nothing in the
+  tree or on the cloud is affected.
 - **An unreadable parent.** rclone reports a path behind an unreadable parent
   with the same code as a path that is not there, so those two stay conflated and
   such a unit reads as "nothing on the cloud" rather than `?`.
@@ -603,7 +679,8 @@ does not use git.
   root — never per node.
 - Transfers are additive (`rclone copy`) by default; mirroring (`rclone sync`)
   is an explicit per-command opt-in, allowed only on a single unit — never on a
-  no-arg walk.
+  no-arg walk. `ferry sync` converges both directions additively (toward the
+  union); it never propagates deletions and takes no `--mirror`/`--force`.
 - A no-arg `pull`/`push` walk continues past a failed unit and exits non-zero
   with a tally; re-running resumes (additive copy is idempotent).
 - `.git/` and `.ferry` are **always** excluded from transfers (`--exclude`).

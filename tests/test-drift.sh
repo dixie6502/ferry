@@ -10,60 +10,9 @@
 
 set -uo pipefail
 
-readonly REPO=$(cd "$(dirname "$0")/.." && pwd -P)
-readonly FERRY=$REPO/ferry
-readonly SANDBOX=$REPO/tmp/t
-readonly WORK=$SANDBOX/work
-readonly CLOUD=$SANDBOX/cloud/Projects
-
-export XDG_CACHE_HOME=$SANDBOX/cache   # keep the real ~/.cache/ferry untouched
-
-pass=0 fail=0
-
-# Reset the whole sandbox and re-init the tree root.
-reset_tree() {
-    rm -rf "$SANDBOX"
-    mkdir -p "$WORK" "$CLOUD"
-    (cd "$WORK" && "$FERRY" init ":local:$CLOUD" >/dev/null)
-}
-
-ferry() { (cd "$WORK" && "$FERRY" "$@"); }
-
-# ferry keys its state by remote base + unit path; mirror that here.
-state_of() {
-    local base=":local:$CLOUD" key='' i c
-    for (( i = 0; i < ${#base}; i++ )); do
-        c=${base:i:1}
-        case $c in
-            [A-Za-z0-9._-]) key+=$c ;;
-            *) printf -v c '%%%02X' "'$c"; key+=$c ;;
-        esac
-    done
-    printf '%s/ferry/%s%s' "$XDG_CACHE_HOME" "$key" "${1:+/$1}"
-}
-
-# The drift symbol ferry reports for a unit (first field of its status row).
-symbol_of() { ferry status "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
-
-# The per-file classification lines, "class path" each, sorted.
-detail_of() { ferry status "$1" 2>/dev/null | awk 'NR>1{print $1, $2, $3}' | sort; }
-
-check() {
-    local label=$1 want=$2 got=$3
-    if [ "$want" = "$got" ]; then
-        pass=$((pass + 1)); printf '  ok    %-46s %s\n' "$label" "$got"
-    else
-        fail=$((fail + 1)); printf '  FAIL  %-46s want %-4s got %s\n' "$label" "$want" "$got"
-    fi
-}
-
-# A unit pushed once, holding one file — the baseline every drift case starts from.
-synced_unit() {
-    local name=$1
-    ferry new "$name" >/dev/null
-    printf 'original\n' > "$WORK/$name/doc.txt"
-    ferry push "$name" >/dev/null 2>&1
-}
+SUITE_TMP=t
+# shellcheck source=tests/common.sh
+source "$(dirname "$0")/common.sh"
 
 printf '\n== lifecycle ==\n'
 reset_tree
@@ -75,6 +24,8 @@ ferry push demo >/dev/null 2>&1
 check 'after push' '=' "$(symbol_of demo)"
 ferry pull demo >/dev/null 2>&1
 check 'after pull' '=' "$(symbol_of demo)"
+ferry new hollow >/dev/null
+check 'push of an empty unit succeeds' '0' "$(ferry push hollow >/dev/null 2>&1; echo $?)"
 
 printf '\n== modification (the case that used to read as divergence) ==\n'
 reset_tree; synced_unit m
@@ -211,6 +162,78 @@ wait
 check 'file created during a push' '>' "$(symbol_of r)"
 check '  classified' 'local add during.txt' "$(detail_of r)"
 
+printf '\n== direction comes from ancestor hashes, not mtimes ==\n'
+# rclone preserves source mtimes, so an edit made on another machine before our
+# baseline and pushed after it reaches the cloud with a pre-baseline mtime.
+# Only the recorded ancestor hash can still call it a cloud change.
+reset_tree; synced_unit h
+printf 'edited there, old mtime\n' > "$CLOUD/h/doc.txt"
+touch -d '2020-01-01' "$CLOUD/h/doc.txt"
+check 'cloud edit with a pre-baseline mtime' '<' "$(symbol_of h)"
+check '  classified' 'remote edit doc.txt' "$(detail_of h)"
+
+# The same lie must not flip a conflict into 'local' — that is the exact
+# misattribution the transfer guard would then act on, letting a push
+# overwrite the other machine's work.
+reset_tree; synced_unit h
+printf 'edited here\n' > "$WORK/h/doc.txt"
+printf 'edited there, old mtime\n' > "$CLOUD/h/doc.txt"
+touch -d '2020-01-01' "$CLOUD/h/doc.txt"
+check 'both edit, cloud mtime pre-baseline' '<>' "$(symbol_of h)"
+check '  classified' 'both edit doc.txt' "$(detail_of h)"
+
+# The local mirror of the lie: cp -p, unzip and tar -x preserve mtimes on an
+# in-place overwrite here.
+reset_tree; synced_unit h
+printf 'replaced here, old mtime\n' > "$WORK/h/doc.txt"
+touch -d '2020-01-01' "$WORK/h/doc.txt"
+check 'local edit with a pre-baseline mtime' '>' "$(symbol_of h)"
+check '  classified' 'local edit doc.txt' "$(detail_of h)"
+
+printf '\n== a transfer moves what only content distinguishes ==\n'
+# Same size, restored mtime: only the hash differs. rclone's default skip rule
+# (size+modtime) would leave the file untransferred while its cloud hash is
+# recorded as the shared ancestor — and a later push would overwrite the cloud
+# edit ferry never saw. --checksum makes "skipped" mean "identical".
+reset_tree; synced_unit k
+touch -r "$CLOUD/k/doc.txt" "$SANDBOX/stamp"
+printf 'oRiGiNaL\n' > "$CLOUD/k/doc.txt"           # same 9 bytes, new content
+touch -r "$SANDBOX/stamp" "$CLOUD/k/doc.txt"
+check 'same-size restored-mtime cloud edit' '<' "$(symbol_of k)"
+ferry pull k >/dev/null 2>&1
+check '  the pull carried the content' 'oRiGiNaL' "$(cat "$WORK/k/doc.txt")"
+check '  clean afterwards' '=' "$(symbol_of k)"
+
+printf '\n== a filename cannot spoof the check summary counters ==\n'
+# The error-excess gate reads its numbers from rclone's NOTICE summary; a
+# report line for a file named like the summary must not be the source.
+reset_tree
+ferry new sp >/dev/null
+printf 'x\n' > "$WORK/sp/0 errors while checking.txt"
+ferry push sp >/dev/null 2>&1
+printf 'y\n' > "$WORK/sp/0 errors while checking.txt"
+check 'still classifies, not ?' '>' "$(symbol_of sp)"
+
+printf '\n== the manifest records ancestors as "<hash> <path>" ==\n'
+reset_tree; synced_unit f
+check 'v2 header names the hash type' '#ferry v2 md5' \
+    "$(head -1 "$(state_of f)/manifest")"
+check 'ancestor line carries the hash' \
+    "$(md5sum "$CLOUD/f/doc.txt" | awk '{print $1}') doc.txt" \
+    "$(sed -n 2p "$(state_of f)/manifest")"
+
+printf '\n== a v1 manifest (paths only) still attributes membership ==\n'
+# State written before hashes existed: edits fall back to mtimes, one-sided
+# attribution keeps working, and no re-baseline is forced.
+reset_tree; synced_unit o
+sed -E -i '1d; s/^[^ ]+ //' "$(state_of o)/manifest"
+printf 'edited here\n' > "$WORK/o/doc.txt"
+check 'v1: local edit still local' '>' "$(symbol_of o)"
+check '  classified' 'local edit doc.txt' "$(detail_of o)"
+rm "$WORK/o/doc.txt"
+check 'v1: local delete still local' '>' "$(symbol_of o)"
+check '  classified' 'local delete doc.txt' "$(detail_of o)"
+
 printf '\n== an unreadable cloud subtree is never read as sync ==\n'
 reset_tree; synced_unit y
 mkdir -p "$CLOUD/y/sub"; printf 'hidden\n' > "$CLOUD/y/sub/f.txt"
@@ -297,15 +320,15 @@ printf 'edited there\n' > "$CLOUD/p/doc.txt"
 check 'diverged: status' '<>' "$(symbol_of p)"
 check 'diverged: prompt' '<>' "$(prompt_of p)"
 
-# A conflict only a content check can see: both sides differ, but neither file's
-# mtime moved past the baseline. The prompt's own walk finds nothing — it must
-# carry the 'diverged' bit `status` recorded instead of downgrading to '<'.
+# A conflict only content can see: both sides differ, but neither file's mtime
+# moved past the baseline. The ancestor hashes attribute both sides, and the
+# prompt — whose own walk is mtime-only and finds nothing — must carry the
+# 'diverged' bit `status` recorded instead of downgrading to '<'.
 reset_tree; synced_unit p
+printf 'edited here\n' > "$WORK/p/doc.txt"
 printf 'edited there\n' > "$CLOUD/p/doc.txt"
-touch -r "$(state_of p)/synced_at" -d '-1 hour' "$CLOUD/p/doc.txt" 2>/dev/null \
-    || touch -d '-1 hour' "$CLOUD/p/doc.txt"
-check 'same-mtime conflict: status' '<>' "$(symbol_of p)"
-check 'same-mtime conflict: prompt keeps it' '<>' "$(prompt_of p)"
+touch -d '2020-01-01' "$WORK/p/doc.txt" "$CLOUD/p/doc.txt"
+check 'old-mtime conflict: status' '<>' "$(symbol_of p)"
+check 'old-mtime conflict: prompt keeps it' '<>' "$(prompt_of p)"
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+report

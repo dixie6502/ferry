@@ -10,58 +10,9 @@
 
 set -uo pipefail
 
-readonly REPO=$(cd "$(dirname "$0")/.." && pwd -P)
-readonly FERRY=$REPO/ferry
-readonly SANDBOX=$REPO/tmp/tr
-readonly WORK=$SANDBOX/work
-readonly CLOUD=$SANDBOX/cloud/Projects
-
-export XDG_CACHE_HOME=$SANDBOX/cache
-
-pass=0 fail=0
-
-reset_tree() {
-    rm -rf "$SANDBOX"
-    mkdir -p "$WORK" "$CLOUD"
-    (cd "$WORK" && "$FERRY" init ":local:$CLOUD" >/dev/null)
-}
-
-ferry() { (cd "$WORK" && "$FERRY" "$@"); }
-
-# ferry keys its state by remote base + unit path; mirror that here.
-state_of() {
-    local base=":local:$CLOUD" key='' i c
-    for (( i = 0; i < ${#base}; i++ )); do
-        c=${base:i:1}
-        case $c in
-            [A-Za-z0-9._-]) key+=$c ;;
-            *) printf -v c '%%%02X' "'$c"; key+=$c ;;
-        esac
-    done
-    printf '%s/ferry/%s%s' "$XDG_CACHE_HOME" "$key" "${1:+/$1}"
-}
-
-check() {
-    local label=$1 want=$2 got=$3
-    if [ "$want" = "$got" ]; then
-        pass=$((pass + 1)); printf '  ok    %-46s %s\n' "$label" "$got"
-    else
-        fail=$((fail + 1)); printf '  FAIL  %-46s want %-4s got %s\n' "$label" "$want" "$got"
-    fi
-}
-
-synced_unit() {
-    local name=$1
-    ferry new "$name" >/dev/null
-    printf 'original\n' > "$WORK/$name/doc.txt"
-    ferry push "$name" >/dev/null 2>&1
-}
-
-diverge() {
-    local name=$1
-    printf 'edited here\n' > "$WORK/$name/doc.txt"
-    printf 'edited there\n' > "$CLOUD/$name/doc.txt"
-}
+SUITE_TMP=tr
+# shellcheck source=tests/common.sh
+source "$(dirname "$0")/common.sh"
 
 stage_of() { printf '%s/conflict' "$(state_of "$1")"; }
 
@@ -172,5 +123,4 @@ check 'exits 0' '0' "$rc"
 check 'reports it as a cloud-side deletion' 'yes' "$(grep -q 'remote delete .*history.bundle' <<<"$out" && echo yes || echo no)"
 check 'offers no broken git fetch' 'no' "$(grep -q 'git -C' <<<"$out" && echo yes || echo no)"
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+report
