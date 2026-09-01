@@ -15,6 +15,10 @@
 # A node's remote path is DERIVED: <base> + <path under the root>. The base is
 # stored once, at the root; nothing else stores a path.
 #
+# Files are kept out of every transfer by `.ferryignore`: one at the tree root
+# (rules for every unit) and one per unit, both read relative to the unit. What
+# is ignored is excluded from transfers AND from drift, so the two never disagree.
+#
 #   ferry init <base>     make $PWD a root holding <base>   (no nested roots)
 #   ferry list [<dir>]    remote children of a node (no local dir needed)
 #   ferry status [<dir>]  drift for every unit at/under $PWD
@@ -38,6 +42,7 @@ set -euo pipefail
 
 readonly PROG=${0##*/}
 readonly MARKER='.ferry'
+readonly IGNORE_FILE='.ferryignore'
 
 # Per-machine sync state, keyed by a unit's path under the root: an empty
 # BASELINE file whose mtime is the last sync point, a MANIFEST of what the two
@@ -53,6 +58,15 @@ readonly MANIFEST='manifest'
 # transferred is never part of drift either.
 readonly XFER_EXCLUDE=(--exclude '.git' --exclude '.git/**' --exclude "$MARKER")
 readonly FIND_PRUNE=(-name .git -prune -o -name "$MARKER" -prune -o)
+
+# The same two exclusions plus the unit's `.ferryignore` rules, compiled by
+# load_ignore. Every reader of a unit's contents — transfer, drift check,
+# remote listing, local walk — goes through these, never the base arrays: an
+# exclusion that reached one and not the others would leave a file drifted
+# forever (a stuck '>' in the prompt, a permanent 'remote add' in status).
+UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
+UNIT_PRUNE=("${FIND_PRUNE[@]}")
+IGNORE_LOADED=''
 
 # Set by probe_unit: a unit's drift symbol, and the per-file classification
 # behind it (empty unless a full comparison ran).
@@ -178,6 +192,101 @@ units_under() {
     done
 }
 
+# --- ignore rules -----------------------------------------------------------
+# `.ferryignore` keeps files out of a unit — the general form of the `.git` and
+# `.ferry` exclusions above. One file may sit at the tree root (rules for every
+# unit) and one in each unit; both are read RELATIVE TO THE UNIT, so a rule
+# written at the root anchors at each unit's own top.
+#
+# `.gitignore` is deliberately NOT consulted. "Do not version-control this" is a
+# different question from "do not back this up" — ferry exists for the large and
+# private files git is told to skip, and `bundle_git` writes `history.bundle`
+# into `.gitignore` itself, so honouring it would silently stop backing up git
+# history.
+#
+# The grammar is restricted to what `find` and rclone match IDENTICALLY, because
+# both must apply it (see UNIT_EXCLUDE). Blank lines and `#` comments are
+# skipped; everything else is one of:
+#
+#   name          a file or directory called `name`, at any depth
+#   name/         a directory called `name`, at any depth
+#   *.ext         a glob (`*`, `?`, `[...]`) over a name, at any depth
+#   /a/b, /a/b/   a literal path from the unit's top
+#
+# Rejected, loudly: `!` re-inclusion (rclone's `--exclude` has no equivalent),
+# `**` (a bare name already matches at any depth), and an unanchored `a/b`
+# (gitignore anchors it, rclone does not — so it must be written `/a/b`). An
+# anchored pattern must be literal: `find -path` lets `*` cross a `/` and rclone
+# does not, so a glob there would mean two different things.
+
+# Quote the characters `find -path` reads as glob metacharacters, so a literal
+# directory prefix never turns into a pattern.
+escape_find_glob() {
+    local s=$1 out='' i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c=${s:i:1}
+        case $c in '\'|'['|']'|'*'|'?') out+='\' ;; esac
+        out+=$c
+    done
+    printf '%s' "$out"
+}
+
+# Append one ignore file's rules to UNIT_EXCLUDE / UNIT_PRUNE, anchored at $2.
+# A malformed pattern is fatal: continuing would transfer files the user asked
+# to keep out, and a silently-dropped rule is exactly the kind of divergence
+# between the two consumers this design exists to prevent.
+#
+# rclone needs both `p` and `p/**` to cover "file or directory called p" — a
+# bare `--exclude p` skips the file but still descends the directory. `find`
+# needs neither: `-name p -prune` covers both.
+compile_ignore() {   # <ignore file> <unit dir>
+    local file=$1 dir=$2 line pat dironly
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case $line in ''|'#'*) continue ;; esac
+
+        pat=$line dironly=0
+        case $pat in */) dironly=1; pat=${pat%/} ;; esac
+        case $pat in
+            '')     die "$file: '$line' — empty pattern" ;;
+            '!'*)   die "$file: '$line' — re-inclusion ('!') is not supported" ;;
+            *'**'*) die "$file: '$line' — '**' is not supported; a bare name already matches at any depth" ;;
+        esac
+
+        if [[ $pat == */* ]]; then
+            case $pat in
+                /*) ;;
+                *)  die "$file: '$line' — a pattern holding '/' must be anchored to the unit: write '/$pat'" ;;
+            esac
+            case $pat in
+                *[][*?]*) die "$file: '$line' — an anchored pattern must be literal (no '*', '?' or '[')" ;;
+            esac
+            UNIT_PRUNE+=(-path "$(escape_find_glob "$dir$pat")")
+        else
+            UNIT_PRUNE+=(-name "$pat")
+        fi
+        [ "$dironly" = 1 ] && UNIT_PRUNE+=(-type d)
+        UNIT_PRUNE+=(-prune -o)
+
+        [ "$dironly" = 1 ] || UNIT_EXCLUDE+=(--exclude "$pat")
+        UNIT_EXCLUDE+=(--exclude "$pat/**")
+    done < "$file"
+}
+
+# Compile the rules that apply to one unit into UNIT_EXCLUDE / UNIT_PRUNE.
+# Memoized per unit: every per-unit entry point calls it, and a walk visits each
+# unit once. The unit's own file is read last, so it extends the root's rules.
+load_ignore() {   # <unit dir>
+    local dir=$1 f
+    [ "$IGNORE_LOADED" = "$dir" ] && return 0
+    UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
+    UNIT_PRUNE=("${FIND_PRUNE[@]}")
+    for f in "${ROOT:+$ROOT/$IGNORE_FILE}" "$dir/$IGNORE_FILE"; do
+        [ -n "$f" ] && [ -f "$f" ] && compile_ignore "$f" "$dir"
+    done
+    IGNORE_LOADED=$dir
+}
+
 # --- cloud probes & sync state ----------------------------------------------
 # Whether a remote path is there: 0 present, 1 absent, 2 could not tell. Failing
 # to *look* must never read as absence — that turns an unreachable cloud into a
@@ -238,10 +347,10 @@ record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/remote"; }
 remote_listing() {   # <hash type or ''> <remote>
     if [ -n "$1" ]; then
         TZ=UTC rclone lsf -R --files-only --format thp --separator ';' \
-            --time-format max --hash "$1" "${XFER_EXCLUDE[@]}" "$2"
+            --time-format max --hash "$1" "${UNIT_EXCLUDE[@]}" "$2"
     else
         TZ=UTC rclone lsf -R --files-only --format tp --separator ';' \
-            --time-format max "${XFER_EXCLUDE[@]}" "$2" | sed 's/^[^;]*;/&;/'
+            --time-format max "${UNIT_EXCLUDE[@]}" "$2" | sed 's/^[^;]*;/&;/'
     fi
 }
 
@@ -251,7 +360,7 @@ remote_listing() {   # <hash type or ''> <remote>
 # Returns non-zero if the side could not be listed.
 list_side() {
     case "$1" in
-        local)  find "$2" "${FIND_PRUNE[@]}" -type f -printf '%P\n' | sort ;;
+        local)  find "$2" "${UNIT_PRUNE[@]}" -type f -printf '%P\n' | sort ;;
         remote) remote_listing "${3:-}" "$2" \
                     | sed -E 's/^[^;]*;([^;]*);/\1 /' | sort -t' ' -k2 ;;
     esac
@@ -320,7 +429,7 @@ mark_synced() {
 # True if a unit holds any transferable file (markers and git internals aside).
 has_local_content() {
     [ -d "$1" ] || return 1
-    [ -n "$(find "$1" "${FIND_PRUNE[@]}" -type f -print -quit)" ]
+    [ -n "$(find "$1" "${UNIT_PRUNE[@]}" -type f -print -quit)" ]
 }
 
 # Did one side change a file since the last sync? Judged against the recorded
@@ -381,7 +490,7 @@ classify_unit() {
     read_manifest "$sd/$MANIFEST"
 
     while IFS= read -r p; do lmoved[$p]=1; done < <(
-        find "$dir" "${FIND_PRUNE[@]}" -type f -newer "$base" -printf '%P\n')
+        find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$base" -printf '%P\n')
 
     # rclone exits 1 both for "differences found" (the normal case here) and for
     # trouble, and downgrades a directory it could not list to a stderr tally
@@ -396,7 +505,7 @@ classify_unit() {
     # prefix, and a user's RCLONE_LOG_FORMAT would otherwise change it.
     local output status=0 differences errors
     output=$(rclone check --combined - --log-format 'date,time' \
-        "${XFER_EXCLUDE[@]}" "$dir" "$rp" 2>&1) || status=$?
+        "${UNIT_EXCLUDE[@]}" "$dir" "$rp" 2>&1) || status=$?
     if [ "$status" -gt 1 ]; then return 1; fi
     if [ "$status" = 1 ]; then
         # Counters come only from the timestamped NOTICE summary lines, matched
@@ -521,6 +630,7 @@ print_drift_files() {
 # DRIFT is '?' when the cloud could not be read — never a confident symbol.
 probe_unit() {
     local dir=$1 rp sd base bits reachable=0
+    load_ignore "$dir"
     rp=$(remote_of "$dir"); sd=$(state_path "$(spec_of "$dir")"); base=$sd/$BASELINE
     DRIFT_FILES=''
 
@@ -575,9 +685,10 @@ probe_unit() {
 # "skipped" means "identical", which is what mark_synced records. A path list
 # ($3, newline-separated): every listed file is known to differ or be
 # one-sided, so the copy is inevitable — --ignore-times forces it instead of
-# re-verifying. rclone forbids other filters beside --files-from-raw (raw: the
-# plain variant reads '#'/';' names as comments), which is safe here: the
-# lists come from a classification that already ran under XFER_EXCLUDE.
+# re-verifying. rclone refuses every other filter beside --files-from-raw (raw:
+# the plain variant reads '#'/';' names as comments), which is safe here: the
+# lists come from a classification that already ran under UNIT_EXCLUDE, so
+# nothing ignored can reach one.
 transfer() {
     local src=$1 dst=$2 files=${3:-} verb=copy
     [ "$MIRROR" = 1 ] && verb=sync
@@ -590,7 +701,7 @@ transfer() {
     else
         local -a flags=()
         [ -n "$HASH_TYPE" ] && flags+=(--checksum)
-        rclone "$verb" ${flags[@]+"${flags[@]}"} "${XFER_EXCLUDE[@]}" --progress "$src" "$dst"
+        rclone "$verb" ${flags[@]+"${flags[@]}"} "${UNIT_EXCLUDE[@]}" --progress "$src" "$dst"
     fi
 }
 
@@ -691,6 +802,7 @@ guard_transfer() {
 # Each returns non-zero (rather than dying) so a walk can tally and carry on.
 pull_unit() {
     local dir=$1 rp manifest; rp=$(remote_of "$dir")
+    load_ignore "$dir"
     guard_transfer pull "$dir" || return 1
     # An additive pull leaves cloud ⊆ local, so the cloud's list — hashes
     # included — is the set the two sides will share. A listing that fails must
@@ -706,6 +818,7 @@ pull_unit() {
 
 push_unit() {
     local dir=$1 rp paths; rp=$(remote_of "$dir")
+    load_ignore "$dir"
     [ -d "$dir" ] || { printf '%s: no local dir %s\n' "$PROG" "$dir" >&2; return 1; }
     guard_transfer push "$dir" || return 1
     bundle_git "$dir" || return 1          # before the snapshot: the bundle is content
@@ -756,6 +869,7 @@ sync_point() {   # <rp> <spec> <local paths> [<conflicted path>...]
 # converges everything safe and leaves each conflict in place for `resolve`.
 sync_unit() {
     local dir=$1 rp spec; rp=$(remote_of "$dir"); spec=$(spec_of "$dir")
+    load_ignore "$dir"
     bundle_git "$dir" || return 1   # before the probe: the bundle is content to classify
     probe_unit "$dir"
 

@@ -124,6 +124,44 @@ on *both* sides moves in neither direction — sync converges everything safe,
 lists the conflicts, and points at `resolve`. `push` and `pull` remain for the
 directional cases: first publish, first materialize, and `--force`.
 
+### Ignoring files
+
+`.ferryignore` keeps files out of a unit, the way `.gitignore` keeps them out of a
+commit. One may sit at the **tree root** (rules for every unit) and one in **each
+unit**; both are read *relative to the unit*, and a unit's file extends the root's
+rather than replacing it.
+
+```
+node_modules/          a directory called node_modules, at any depth
+*.log                  a glob over a name, at any depth
+scratch notes.txt      a name, at any depth (spaces are fine)
+/build/                a literal path from the top of the unit
+# comments and blank lines are skipped
+```
+
+Those four shapes are the whole grammar — it is the part `find` and rclone match
+*identically*, and both have to, because what is excluded from a transfer is also
+excluded from **drift**. An ignored file never shows in `status`, never lands in
+the manifest, and does not drive the prompt (one rough edge there — see
+[Prompt indicator](#prompt-indicator)); an ignored file already on the cloud is
+not a `remote add`, and `--mirror` will not delete it. Nothing is
+half-applied: `!` re-inclusion, `**`, an unanchored `a/b` (write `/a/b`) and a
+glob inside an anchored pattern are each rejected outright, with the offending
+line quoted.
+
+Ignoring is not deleting — a rule removes a path from ferry's view on both sides,
+and dropping the rule hands the file back as an ordinary `remote add`.
+
+The unit-level file rides up with the unit, so the rules travel between machines.
+The root-level one sits outside every unit and stays local, like the root `.ferry`.
+
+**`.gitignore` is deliberately not consulted.** "Do not version-control this" is a
+different question from "do not back this up" — ferry is *for* the large and
+private files git is told to skip, and `push` writes `history.bundle` into
+`.gitignore` itself, so honouring it would silently stop backing up your git
+history. Opt in by hand if you want it (`cat .gitignore >> .ferryignore`); the
+grammar will reject anything it cannot match the same way rclone does.
+
 ### No-arg walk & flags
 
 `ferry sync` / `ferry pull` / `ferry push` with no argument walk **down** from
@@ -253,10 +291,21 @@ depth. The local side (`>`) is computed offline on every prompt with a single
 `find` since the last sync; the cloud side (`<`) is only as fresh as your last
 `ferry status`, and gets a trailing `?` once that bit is over a day old.
 
+It applies your `.ferryignore` rules too, so an ignored file never puts `>` in the
+prompt. One rough edge remains: the `find` reads a directory's mtime as evidence
+of a deletion it cannot otherwise see, and *creating or removing* an ignored file
+bumps its parent — so the prompt may briefly say `>` where `ferry status` says
+`=`, until the next sync. Writes *inside* an ignored directory never do this, so
+prefer `build/` over a glob scattered at the top of a unit.
+
 ## How it works
 
 - **Additive by default** — `copy` never deletes the far side. Deletions
   propagate only with `--mirror` (`rclone sync`).
+- **One exclusion set** — `.git/`, the markers and everything `.ferryignore`
+  names are compiled once per unit and applied by *every* reader: transfers, the
+  drift check, both listings, the manifest and the prompt. What is not
+  transferred is not drift.
 - **Presence = pulled or created** — a unit is local because you pulled it or
   `new`ed it. `drop` frees disk; the cloud is authoritative for retention (`rm`,
   which acts only on a local unit, is the explicit exception).
@@ -283,7 +332,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
 ```sh
 tests/run              # every suite
-tests/run drift        # one of: drift | guard | resolve
+tests/run drift        # one of: drift | guard | resolve | sync | ignore
 ```
 
 They drive the real `ferry` script against a **real rclone backend** — the cloud
@@ -298,6 +347,7 @@ from them. Scratch trees are built under `tmp/` and reset by each suite.
 | `guard` | which transfers are refused and which stay frictionless, `--mirror`, `--force`, walks |
 | `resolve` | staging the cloud's side, the git merge-base hint, stale staging, filenames rclone would otherwise drop |
 | `sync` | both directions in one run, deletions restored (union), conflicts left in place and still resolvable, walks |
+| `ignore` | `.ferryignore` on both sides: unit and tree-root rules, anchoring, `sync` and `--mirror` safety, refused patterns, prompt agreement |
 
 ## ToDo before going public
 - [x] Bash shell completion (`ferry completion bash`)

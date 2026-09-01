@@ -11,12 +11,12 @@
 # Scratch trees are built under tmp/ (gitignored) and reset by each suite.
 #
 # Usage: tests/run            (from anywhere)
-#        tests/run drift      (one suite: drift | guard | resolve | sync)
+#        tests/run drift      (one suite: drift | guard | resolve | sync | ignore)
 
 set -uo pipefail
 
 readonly HERE=$(cd "$(dirname "$0")" && pwd -P)
-readonly SUITES=(drift guard resolve sync)
+readonly SUITES=(drift guard resolve sync ignore)
 
 command -v rclone >/dev/null || { printf 'tests: rclone not found\n' >&2; exit 1; }
 

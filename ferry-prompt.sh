@@ -44,15 +44,64 @@
 
 # Must match the constants in `ferry`; override only if you changed them there.
 : "${FERRY_MARKER:=.ferry}"
+: "${FERRY_IGNORE:=.ferryignore}"
 : "${FERRY_STATE_ROOT:=${XDG_CACHE_HOME:-$HOME/.cache}/ferry}"
 : "${FERRY_PS1_STALE:=86400}"
 
+# Quote the characters `find -path` reads as glob metacharacters. Mirrors
+# `ferry`'s escape_find_glob.
+__ferry_ps1_escape() {
+    local s=$1 out='' i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c=${s:i:1}
+        case $c in '\'|'['|']'|'*'|'?') out+='\' ;; esac
+        out+=$c
+    done
+    printf '%s' "$out"
+}
+
+# Compile the tree-root and unit `.ferryignore` files into `find` prune
+# predicates, appended to the caller's `prune` array.
+#
+# This duplicates `ferry`'s compile_ignore, deliberately and by the same
+# reasoning that keeps the rest of this file standalone: the local half of the
+# indicator must stay a single offline `find`, with no `ferry` process per
+# prompt. Ignoring the rules instead is not an option — an ignored file would
+# leave '>' stuck on a clean unit forever. The grammar is small enough that the
+# two copies are checkable against each other; keep them in step. A line this
+# cannot compile is skipped rather than reported — a prompt must never fail
+# loudly, and `ferry` itself rejects it the next time it runs.
+__ferry_ps1_ignore() {
+    local root=$1 unit=$2 file line pat dironly
+    for file in "$root/$FERRY_IGNORE" "$unit/$FERRY_IGNORE"; do
+        [ -r "$file" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%$'\r'}
+            case $line in ''|'#'*|'!'*|*'**'*) continue ;; esac
+            pat=$line dironly=0
+            case $pat in */) dironly=1; pat=${pat%/} ;; esac
+            case $pat in
+                '') continue ;;
+                /*) case $pat in *[][*?]*) continue ;; esac
+                    prune+=(-path "$(__ferry_ps1_escape "$unit$pat")") ;;
+                */*) continue ;;                      # unanchored '/' — rejected
+                *)  prune+=(-name "$pat") ;;
+            esac
+            [ "$dironly" = 1 ] && prune+=(-type d)
+            prune+=(-prune -o)
+        done < "$file"
+    done
+}
+
 # Print '>' if anything in the unit changed since the marker; nothing if clean.
-# Prunes .git, history.bundle, and the marker — none is synced as content.
+# Prunes .git, history.bundle, the marker and everything `.ferryignore` keeps
+# out — none of it is synced as content, so none of it is drift.
 __ferry_ps1_local_changed() {
-    local dir=$1 marker=$2
-    [ -n "$(find "$dir" \( -name .git -o -name history.bundle -o -name "$FERRY_MARKER" \) -prune \
-                 -o -newer "$marker" -print -quit 2>/dev/null)" ] && printf '>'
+    local dir=$1 marker=$2 root=$3
+    local -a prune=(-name .git -prune -o -name history.bundle -prune -o
+                    -name "$FERRY_MARKER" -prune -o)
+    __ferry_ps1_ignore "$root" "$dir"
+    [ -n "$(find "$dir" "${prune[@]}" -newer "$marker" -print -quit 2>/dev/null)" ] && printf '>'
 }
 
 # Emit the indicator for the unit enclosing $PWD, wrapped in the format string
@@ -104,7 +153,7 @@ __ferry_ps1() {
     fi
 
     local ahead behind="" rstate rtime now
-    ahead=$(__ferry_ps1_local_changed "$unit" "$marker")
+    ahead=$(__ferry_ps1_local_changed "$unit" "$marker" "$root")
 
     # Cloud bit from the last `ferry status` (written alongside the marker).
     # 'diverged' also forces the local half: `ferry status` compares content and

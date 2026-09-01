@@ -212,6 +212,86 @@ down into rclone or out into operational config (enable bucket versioning) — n
 because it detects the backend and adapts. Adding such a branch would be the wrong
 move; the genericity is a property of the model, not of special-casing.
 
+## Ignore rules
+
+`.ferryignore` keeps files out of a unit — the general form of the `.git`/`.ferry`
+exclusions every transfer already carries. One file may sit at the **tree root**
+(rules for every unit) and one in **each unit**; both are read *relative to the
+unit*, so a rule written at the root anchors at each unit's own top. A unit's file
+extends the root's rather than replacing it. The unit-level file is ordinary
+content and rides up with the unit; the root-level one sits outside every unit and
+stays local, like the root `.ferry` itself.
+
+**One rule set, every reader.** The design constraint is not the file format — it
+is that six consumers must agree on what a unit contains: `rclone copy`/`sync`,
+`rclone check`, the remote `lsf` listing, the local `find` walk, the manifest
+built from those two listings, and `ferry-prompt.sh`. An exclusion that reached
+one and not the others would leave a file permanently drifted: a stuck `>` in the
+prompt, a `remote add` that no transfer can ever clear. So `load_ignore` compiles
+each unit's rules **once**, into the two forms every consumer needs —
+`UNIT_EXCLUDE` (rclone filter flags) and `UNIT_PRUNE` (`find` predicates) — and
+nothing reads the base arrays directly. `--files-from-raw` is the one transfer
+that carries no filters (rclone refuses to combine them); it is safe because its
+path list comes from a classification that already ran under `UNIT_EXCLUDE`.
+
+**Not `.gitignore`.** Two reasons, either sufficient:
+
+- *Different question.* "Do not version-control this" is not "do not back this
+  up". ferry exists for exactly the large and private files git is told to skip —
+  the [mixed-project layout](#git-optional-per-project) below has PDFs
+  `.gitignore`d and rclone-synced on purpose. Worse, `bundle_git` appends
+  `history.bundle` to `.gitignore` itself, so honouring it by default would
+  silently stop backing up git history — and `drop` would then destroy it.
+- *Different syntax.* rclone filters are not gitignore: `build/` ≠ `build/**`,
+  `!` re-inclusion has no `--exclude` equivalent, and gitignore is last-match-wins
+  across nested per-directory files where rclone is a flat root-relative list.
+  Honouring it correctly means writing a translator; honouring it approximately
+  means silently syncing — or not syncing — the wrong files.
+
+A tree may opt in by hand (`cat .gitignore >> .ferryignore`), which is explicit
+and reviewable, and fails loudly on any pattern the grammar does not cover.
+
+**The grammar is the intersection of `find` and rclone**, deliberately, because
+both must apply it. Blank lines and `#` comments are skipped; everything else is
+one of:
+
+| Pattern | Matches | rclone | `find` |
+|---|---|---|---|
+| `name` | a file or directory `name`, any depth | `--exclude name` + `name/**` | `-name name -prune` |
+| `name/` | a directory `name`, any depth | `--exclude 'name/**'` | `-name name -type d -prune` |
+| `*.ext` | a glob (`*`, `?`, `[…]`) over a name, any depth | `--exclude '*.ext'` | `-name '*.ext' -prune` |
+| `/a/b`, `/a/b/` | a literal path from the unit's top | `--exclude /a/b` (+ `/**`) | `-path <unit>/a/b -prune` |
+
+Everything else is a **fatal** error, not a skipped line: `!` re-inclusion, `**`
+(a bare name already matches at any depth), an unanchored `a/b` (gitignore anchors
+it, rclone does not — write `/a/b`), and a glob inside an anchored pattern
+(`find -path` lets `*` cross a `/`, rclone does not, so the two would mean
+different things). Continuing past a malformed rule would transfer files the user
+asked to keep out; failing the run is the cheap, loud alternative.
+
+**Ignoring is not deleting.** A rule removes a path from ferry's view on *both*
+sides. Filters apply to the destination listing too, so `--mirror` will not delete
+an already-uploaded copy; the path simply leaves manifest membership at the next
+successful sync. Dropping a rule hands the file back — it reappears as an ordinary
+`remote add`.
+
+**The prompt keeps its own copy of the compiler.** `ferry-prompt.sh` must stay a
+single offline `find` with no `ferry` process per prompt, so it re-implements the
+same restricted grammar (skipping, rather than reporting, a line it cannot
+compile — a prompt must never fail loudly). The alternative — the prompt ignoring
+the rules — is exactly the stuck `>` this section exists to prevent. The grammar
+is small enough that the two copies are checkable against each other; the `ignore`
+suite asserts they agree.
+
+**Known limit — a pruned entry still stamps its parent.** The prompt's local half
+is mtime-only, and it reads a directory's mtime as evidence of a deletion it
+cannot otherwise see. Creating or removing an ignored file bumps its parent
+directory, so the prompt may show `>` on a unit `ferry status` calls `=`, until
+the next sync re-baselines it. This is the same over-report a bare `touch` already
+produces, in the same conservative direction, and it does not arise for writes
+*within* an ignored directory (the directory itself is pruned) — which is the
+reason to prefer `build/` over a glob scattered at the unit's top.
+
 ## Drift classification
 
 `status` reports drift as `= > < <>`, and the direction has to be **earned**: a
@@ -683,7 +763,9 @@ does not use git.
   union); it never propagates deletions and takes no `--mirror`/`--force`.
 - A no-arg `pull`/`push` walk continues past a failed unit and exits non-zero
   with a tally; re-running resumes (additive copy is idempotent).
-- `.git/` and `.ferry` are **always** excluded from transfers (`--exclude`).
+- `.git/` and `.ferry` are **always** excluded from transfers (`--exclude`);
+  `.ferryignore` extends that per tree and per unit, and what it excludes is
+  excluded from drift too — one compiled rule set, every reader.
 - `ferry push` on a git project writes the bundle to a temp name and
   **atomically renames** it before pushing.
 - A unit is born from `new` (empty marker written at creation) or `pull`; its
