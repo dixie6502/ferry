@@ -90,6 +90,20 @@ check 'an ignored cloud file is not a "remote add"' '=' "$(symbol_of u)"
 ferry pull u >/dev/null 2>&1
 check '  and pull leaves it there, unfetched' 'no' "$([ -e "$WORK/u/server.log" ] && echo yes || echo no)"
 
+printf '\n== a first pull obeys the cloud copy of the unit rules ==\n'
+# The unit's .ferryignore is not local yet, so the cloud's is the rule set:
+# otherwise the pull lists, hashes and fetches everything it keeps out.
+mkdir -p "$CLOUD/c/.venv/lib"
+printf '.venv/\n' > "$CLOUD/c/.ferryignore"
+printf 'x\n' > "$CLOUD/c/doc.txt"
+printf 'x\n' > "$CLOUD/c/.venv/lib/site.py"
+ferry pull c >/dev/null 2>&1
+check 'the ignored directory stays on the cloud' 'no' "$([ -e "$WORK/c/.venv" ] && echo yes || echo no)"
+check '  the rules themselves come down' 'yes' "$([ -f "$WORK/c/.ferryignore" ] && echo yes || echo no)"
+check '  the manifest holds only what crossed' '.ferryignore doc.txt' \
+    "$(tail -n +2 "$(state_of c)/manifest" | cut -d' ' -f2- | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+check '  the unit reads as in sync' '=' "$(symbol_of c)"
+
 printf '\n== --mirror does not delete what it cannot see ==\n'
 ferry push u --mirror >/dev/null 2>&1
 check 'the ignored cloud file survives a mirrored push' 'yes' \

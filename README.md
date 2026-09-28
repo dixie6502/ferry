@@ -152,7 +152,9 @@ line quoted.
 Ignoring is not deleting — a rule removes a path from ferry's view on both sides,
 and dropping the rule hands the file back as an ordinary `remote add`.
 
-The unit-level file rides up with the unit, so the rules travel between machines.
+The unit-level file rides up with the unit, so the rules travel between machines:
+a pull into a unit that holds no local `.ferryignore` (a first pull) reads the
+cloud's copy before listing anything, so what it keeps out is never fetched.
 The root-level one sits outside every unit and stays local, like the root `.ferry`.
 
 **`.gitignore` is deliberately not consulted.** "Do not version-control this" is a

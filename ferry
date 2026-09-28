@@ -321,7 +321,8 @@ escape_find_glob() {
     printf '%s' "$out"
 }
 
-# Append one ignore file's rules to UNIT_EXCLUDE / UNIT_PRUNE, anchored at $2.
+# Append one ignore file's rules (stdin) to UNIT_EXCLUDE / UNIT_PRUNE, anchored
+# at $2; $1 names the file in errors.
 # A malformed pattern is fatal: continuing would transfer files the user asked
 # to keep out, and a silently-dropped rule is exactly the kind of divergence
 # between the two consumers this design exists to prevent.
@@ -329,7 +330,7 @@ escape_find_glob() {
 # rclone needs both `p` and `p/**` to cover "file or directory called p" — a
 # bare `--exclude p` skips the file but still descends the directory. `find`
 # needs neither: `-name p -prune` covers both.
-compile_ignore() {   # <ignore file> <unit dir>
+compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
     local file=$1 dir=$2 line pat dironly
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line%$'\r'}
@@ -360,20 +361,42 @@ compile_ignore() {   # <ignore file> <unit dir>
 
         [ "$dironly" = 1 ] || UNIT_EXCLUDE+=(--exclude "$pat")
         UNIT_EXCLUDE+=(--exclude "$pat/**")
-    done < "$file"
+    done
 }
 
 # Compile the rules that apply to one unit into UNIT_EXCLUDE / UNIT_PRUNE.
 # Memoized per unit: every per-unit entry point calls it, and a walk visits each
 # unit once. The unit's own file is read last, so it extends the root's rules.
-load_ignore() {   # <unit dir>
-    local dir=$1 f
+#
+# $2 (pull only) is the unit's remote. A unit holding no local rules then takes
+# the cloud's: they are what the pull brings down, and a first pull has no
+# local copy yet — without this it would list, hash and download everything
+# the unit's own file keeps out (a whole .venv). A cloud that cannot be read
+# fails the load rather than reading as "no rules".
+load_ignore() {   # <unit dir> [<remote>]
+    local dir=$1 rp=${2:-} f rules errf status=0
     [ "$IGNORE_LOADED" = "$dir" ] && return 0
     UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
     UNIT_PRUNE=("${FIND_PRUNE[@]}")
-    for f in "${ROOT:+$ROOT/$IGNORE_FILE}" "$dir/$IGNORE_FILE"; do
-        [ -n "$f" ] && [ -f "$f" ] && compile_ignore "$f" "$dir"
-    done
+    if [ -n "${ROOT:-}" ] && [ -f "$ROOT/$IGNORE_FILE" ]; then
+        compile_ignore "$ROOT/$IGNORE_FILE" "$dir" < "$ROOT/$IGNORE_FILE"
+    fi
+    f=$dir/$IGNORE_FILE
+    if [ -f "$f" ]; then
+        compile_ignore "$f" "$dir" < "$f"
+    elif [ -n "$rp" ]; then
+        # rclone answers 3 for a missing file and for a missing prefix alike;
+        # its log is shown only for real trouble, as in remote_state.
+        errf=$(mktemp)
+        rules=$(run_probe cat "$rp/$IGNORE_FILE" 2>"$errf") || status=$?
+        show_rclone_log "$((status != 0 && status != 3))" "$(<"$errf")"
+        rm -f "$errf"
+        case $status in
+            0) compile_ignore "$rp/$IGNORE_FILE" "$dir" <<<"$rules" ;;
+            3) ;;
+            *) return 1 ;;
+        esac
+    fi
     IGNORE_LOADED=$dir
 }
 
@@ -947,7 +970,7 @@ guard_transfer() {
 # Each returns non-zero (rather than dying) so a walk can tally and carry on.
 pull_unit() {
     local dir=$1 rp manifest; rp=$(remote_of "$dir")
-    load_ignore "$dir"
+    load_ignore "$dir" "$rp" || return 1
     guard_transfer pull "$dir" || return 1
     # An additive pull leaves cloud ⊆ local, so the cloud's list — hashes
     # included — is the set the two sides will share. A listing that fails must

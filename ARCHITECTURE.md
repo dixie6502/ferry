@@ -231,7 +231,10 @@ exclusions every transfer already carries. One file may sit at the **tree root**
 unit*, so a rule written at the root anchors at each unit's own top. A unit's file
 extends the root's rather than replacing it. The unit-level file is ordinary
 content and rides up with the unit; the root-level one sits outside every unit and
-stays local, like the root `.ferry` itself.
+stays local, like the root `.ferry` itself. A `pull` into a unit with no local
+file compiles the **cloud's** copy instead — it is what the pull brings down, and
+a first pull would otherwise list, hash and fetch everything it keeps out. A
+cloud that cannot be read fails the pull rather than reading as "no rules".
 
 **One rule set, every reader.** The design constraint is not the file format — it
 is that six consumers must agree on what a unit contains: `rclone copy`/`sync`,
