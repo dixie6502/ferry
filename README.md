@@ -149,8 +149,9 @@ the manifest, and does not drive the prompt (one rough edge there — see
 [Prompt indicator](#prompt-indicator)); an ignored file already on the cloud is
 not a `remote add`, and `--mirror` will not delete it. Nothing is
 half-applied: `!` re-inclusion, `**`, `{a,b}` alternation, `[!…]` (write
-`[^…]`), an unanchored `a/b` (write `/a/b`) and a glob inside an anchored
-pattern are each rejected outright, with the offending line quoted.
+`[^…]`), an unanchored `a/b` (write `/a/b`), a glob inside an anchored pattern
+and trailing whitespace are each rejected outright, with the offending line
+quoted.
 
 Ignoring is not deleting — a rule removes a path from ferry's view on both sides,
 and dropping the rule hands the file back as an ordinary `remote add`.

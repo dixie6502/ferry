@@ -121,6 +121,26 @@ printf '!keep\n' > "$WORK/a/.ferryignore"
 check 'the batch carries on past it' 'ferry: 1/2 ok, 1 failed: a' "$(ferry push 2>&1 >/dev/null | tail -1)"
 check '  the other unit went up' 'doc.txt ' "$(cloud_of b)"
 
+printf '\n== a root marker without a base is refused ==\n'
+reset_tree
+printf 'not a base\n' > "$WORK/.ferry"
+check 'any command names the bad marker' "1|ferry: $WORK/.ferry holds no remote base ('remote:path'): 'not a base'" \
+    "$(failure_of status)"
+reset_tree
+out=$(cd "$SANDBOX" && "$FERRY" init ':x' 2>&1 >/dev/null); rc=$?
+check 'and init never writes one' "1|ferry: base must look like 'remote:path', got ':x'|no" \
+    "$rc|$out|$(yes_no test -e "$SANDBOX/.ferry")"
+out=$(cd "$SANDBOX" && "$FERRY" init '/mnt/backup:old' 2>&1 >/dev/null); rc=$?
+check '  nor one rclone would read as a local path' '1' "$rc"
+
+printf '\n== a CRLF root marker reads the same everywhere ==\n'
+synced_unit crlf
+printf ':local:%s\r\n' "$CLOUD" > "$WORK/.ferry"
+# shellcheck source=/dev/null
+check 'ferry and the prompt agree' '= =' \
+    "$(symbol_of crlf) $(source "$REPO/ferry-prompt.sh"; cd "$WORK/crlf" && __ferry_ps1 '%s')"
+reset_tree
+
 printf '\n== an error inside a target lookup is reported once ==\n'
 check 'one message, not a cascade' "1|ferry: name must be relative, got '/abs'" "$(failure_of sync /abs)"
 check 'list stops on it too' "1|ferry: name must be relative, got '/abs'" "$(failure_of list /abs)"

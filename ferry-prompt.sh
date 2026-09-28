@@ -1,4 +1,4 @@
-# shellcheck shell=bash disable=SC2059   # $fmt is a caller-supplied printf format
+# shellcheck shell=bash disable=SC2059   # $format is a caller-supplied printf format
 # ferry prompt support — a git-prompt.sh analog for the `ferry` sync tool.
 #
 # Shows, in your shell prompt, how the working tree relates to its cloud copy,
@@ -77,11 +77,12 @@ __ferry_ps1_ignore() {
         [ -r "$file" ] || continue
         while IFS= read -r line || [ -n "$line" ]; do
             line=${line%$'\r'}
-            case $line in ''|'#'*|'!'*|*'**'*|*[{}]*|*'[!'*) continue ;; esac
+            case $line in '#'*|*[![:space:]]*) ;; *) continue ;; esac   # blank
+            case $line in '#'*|'!'*|*'**'*|*[{}]*|*'[!'*) continue ;; esac
             pat=$line dironly=0
             case $pat in */) dironly=1; pat=${pat%/} ;; esac
             case $pat in
-                '') continue ;;
+                ''|*[[:space:]]) continue ;;
                 /*) case $pat in *[][*?]*) continue ;; esac
                     prune+=(-path "$(__ferry_ps1_escape "$unit$pat")") ;;
                 */*) continue ;;                      # unanchored '/' — rejected
@@ -108,39 +109,40 @@ __ferry_ps1_state_key() {
     done
 }
 
-# Print '>' if anything in the unit changed since the marker; nothing if clean.
+# Print '>' if anything in the unit changed since the baseline; nothing if clean.
 # Prunes .git, history.bundle, the marker and everything `.ferryignore` keeps
 # out — none of it is synced as content, so none of it is drift.
 __ferry_ps1_local_changed() {
-    local dir=$1 marker=$2 root=$3
+    local dir=$1 baseline=$2 root=$3
     local -a prune=(-name .git -prune -o -name history.bundle -prune -o
                     -name "$FERRY_MARKER" -prune -o)
     __ferry_ps1_ignore "$root" "$dir"
-    [ -n "$(find "$dir" "${prune[@]}" -newer "$marker" -print -quit 2>/dev/null)" ] && printf '>'
+    [ -n "$(find "$dir" "${prune[@]}" -newer "$baseline" -print -quit 2>/dev/null)" ] && printf '>'
 }
 
 # Emit the indicator for the unit enclosing $PWD, wrapped in the format string
 # ($1, default " (%s)"). Silent when not inside a unit (a grouping dir, the root
 # with children, or outside any tree).
 __ferry_ps1() {
-    local fmt=${1:-" (%s)"}
-    local d=$PWD unit="" root=""
+    local format=${1:-" (%s)"}
+    local dir=$PWD unit="" root=""
 
     # Walk up: the nearest empty marker is the enclosing unit; a marker with
     # content is the root (and stops the walk). One root per tree, by invariant.
-    while [ -n "$d" ] && [ "$d" != / ]; do
-        if [ -f "$d/$FERRY_MARKER" ]; then
-            if [ -s "$d/$FERRY_MARKER" ]; then root=$d; break; fi
-            [ -z "$unit" ] && unit=$d
+    while [ -n "$dir" ] && [ "$dir" != / ]; do
+        if [ -f "$dir/$FERRY_MARKER" ]; then
+            if [ -s "$dir/$FERRY_MARKER" ]; then root=$dir; break; fi
+            [ -z "$unit" ] && unit=$dir
         fi
-        d=${d%/*}
+        dir=${dir%/*}
     done
     [ -n "$root" ] || return   # not inside a ferry tree
 
     # No enclosing empty-marker unit: only valid if the root is itself a leaf
     # (a single-unit tree). If the root has sub-markers, $PWD is in a grouping dir.
     if [ -z "$unit" ]; then
-        [ -z "$(find "$root" -mindepth 2 -name "$FERRY_MARKER" -print -quit 2>/dev/null)" ] || return
+        [ -z "$(find "$root" -name .git -prune -o \
+            -path "$(__ferry_ps1_escape "$root")/*/$FERRY_MARKER" -type f -print -quit 2>/dev/null)" ] || return
         unit=$root
     fi
 
@@ -150,45 +152,46 @@ __ferry_ps1() {
     # plain substitution would map two different bases onto one directory.
     local spec=${unit#"$root"}; spec=${spec#/}
     local base key
-    base=$(head -1 "$root/$FERRY_MARKER")
+    IFS= read -r base < "$root/$FERRY_MARKER" || true
+    base=${base%$'\r'}                  # as `ferry` reads it
     __ferry_ps1_state_key "$base"
-    local sd=$FERRY_STATE_ROOT/$key${spec:+/$spec}
-    local marker=$sd/synced_at remote_bit=$sd/remote   # `ferry`'s BASELINE and REMOTE_BIT
+    local state_dir=$FERRY_STATE_ROOT/$key${spec:+/$spec}
+    local baseline=$state_dir/synced_at remote_bit=$state_dir/remote   # `ferry`'s BASELINE and REMOTE_BIT
 
     # No baseline yet (never pushed/pulled from here) → unknown.
-    if [ ! -e "$marker" ]; then
-        printf -- "$fmt" '?'
+    if [ ! -e "$baseline" ]; then
+        printf -- "$format" '?'
         return
     fi
 
-    local ahead behind="" rstate rtime now
-    ahead=$(__ferry_ps1_local_changed "$unit" "$marker" "$root")
+    local ahead behind="" remote_state remote_time now
+    ahead=$(__ferry_ps1_local_changed "$unit" "$baseline" "$root")
 
-    # Cloud bit from the last `ferry status` (written alongside the marker).
+    # Cloud bit from the last `ferry status` (written alongside the baseline).
     # 'diverged' also forces the local half: `ferry status` compares content and
     # can see a conflict — two sides edited to different bytes with mtimes older
     # than the baseline — that this function's mtime walk never would.
     if [ -r "$remote_bit" ]; then
-        read -r rstate rtime < "$remote_bit"
-        case $rstate in
+        read -r remote_state remote_time < "$remote_bit"
+        case $remote_state in
             behind)   behind='<' ;;
             diverged) behind='<'; ahead='>' ;;
         esac
     fi
 
-    local sym
+    local symbol
     case "$ahead$behind" in
-        '><') sym='<>' ;;
-        '>')  sym='>'  ;;
-        '<')  sym='<'  ;;
-        *)    sym='='  ;;
+        '><') symbol='<>' ;;
+        '>')  symbol='>'  ;;
+        '<')  symbol='<'  ;;
+        *)    symbol='='  ;;
     esac
 
     # Flag a stale cloud bit: the '<'/'=' half may be out of date.
-    if [ "${FERRY_PS1_STALE:-0}" -gt 0 ] && [ -n "${rtime:-}" ]; then
+    if [ "${FERRY_PS1_STALE:-0}" -gt 0 ] && [ -n "${remote_time:-}" ]; then
         now=$(date +%s)
-        [ $((now - rtime)) -gt "$FERRY_PS1_STALE" ] && sym="$sym?"
+        [ $((now - remote_time)) -gt "$FERRY_PS1_STALE" ] && symbol="$symbol?"
     fi
 
-    printf -- "$fmt" "$sym"
+    printf -- "$format" "$symbol"
 }

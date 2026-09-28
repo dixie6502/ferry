@@ -42,7 +42,9 @@ on-demand checkout. The tree shape is emergent, not fixed at any depth.
 ```
 
 - **root** — the one directory whose `.ferry` holds the remote base. Found by
-  walking **up** from `$PWD` (git's `.git` model). Exactly one per tree.
+  walking **up** from `$PWD` (git's `.git` model). Exactly one per tree. A root
+  marker whose first line is not a `remote:path` base (or an rclone
+  `:backend:path` connection string) stops every command that reads the tree.
 - **unit** — a leaf: an empty `.ferry`, with no `.ferry` below it, present locally
   because it was pulled or `new`ed. The granularity of every transfer, git bundle,
   and sync-state record.
@@ -54,6 +56,7 @@ Two invariants keep discovery unambiguous: **units form an antichain** (no unit
 under another — a full pull already brought everything beneath it), and **one
 root per tree** (no content-bearing `.ferry` under another). A unit marker is
 empty; the root marker has content — so the root is never mistaken for a unit.
+The walks **down** never search `.git` for markers.
 
 ### Remote mapping (derived, single-sourced)
 
@@ -172,9 +175,9 @@ destination that exists on either side: `rclone moveto` onto an existing cloud
 directory merges into it, overwriting same-named files. A source the cloud does
 not hold yet (a unit never pushed) is moved locally only — unless it shared
 files with the cloud at its last sync: rclone reports a path behind an
-unreadable parent as absent too, and a local-only move would orphan that copy. Doing the rename locally
-and pushing instead would orphan the old path on the cloud, since `push` is
-additive.
+unreadable parent as absent too, and a local-only move would orphan that copy.
+Doing the rename locally and pushing instead would orphan the old path on the
+cloud, since `push` is additive.
 
 ## Backend agnosticism
 
@@ -286,7 +289,9 @@ Everything else is a **fatal** error, not a skipped line: `!` re-inclusion, `**`
 negation (`find` has no alternation, and rclone reads `!` as a literal), an
 unanchored `a/b` (gitignore anchors it, rclone does not — write `/a/b`), and a
 glob inside an anchored pattern (`find -path` lets `*` cross a `/`, rclone does
-not, so the two would mean different things). Continuing past a malformed rule would transfer files the user
+not, so the two would mean different things), and trailing whitespace (part of
+the pattern to both, where gitignore trims it — a rule that silently matches
+nothing). Continuing past a malformed rule would transfer files the user
 asked to keep out; failing the run is the cheap, loud alternative.
 
 **Ignoring is not deleting.** A rule removes a path from ferry's view on *both*
@@ -787,8 +792,8 @@ does not use git.
 - `.git/` and `.ferry` are **always** excluded from transfers (`--exclude`);
   `.ferryignore` extends that per tree and per unit, and what it excludes is
   excluded from drift too — one compiled rule set, every reader.
-- `ferry push` on a git project writes the bundle to a temp name and
-  **atomically renames** it before pushing.
+- `ferry push` on a git project writes the bundle **atomically** (git writes
+  through `history.bundle.lock`) before pushing.
 - A unit is born from `new` (empty marker written at creation) or `pull`; its
   parent dirs are always markerless grouping dirs, created implicitly. A grouping
   level is never created directly. `new` does not pre-create the cloud folder —

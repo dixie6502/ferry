@@ -148,7 +148,9 @@ printf '*.{jpg,png}\n' > "$WORK/u/.ferryignore"
 check 'alternation' "'{a,b}' alternation is not supported; write one pattern per line" "$(refusal_of status u)"
 printf '[!b].jpg\n' > "$WORK/u/.ferryignore"
 check '[!...] negation' "'[!...]' is not supported; write the negation as '[^...]'" "$(refusal_of status u)"
-printf '# a comment\n\n*.log\n' > "$WORK/u/.ferryignore"
+printf 'node_modules \n' > "$WORK/u/.ferryignore"
+check 'trailing whitespace' 'trailing whitespace would be part of the pattern' "$(refusal_of status u)"
+printf '# a comment\n\n  \n*.log\n' > "$WORK/u/.ferryignore"
 ferry push u >/dev/null 2>&1
 check 'comments and blank lines are skipped' '=' "$(symbol_of u)"
 

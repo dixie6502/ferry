@@ -50,7 +50,8 @@ readonly REMOTE_BIT='remote'
 # FIND_PRUNE is the same exclusion for a local `find` walk: what is never
 # transferred is never part of drift either.
 readonly XFER_EXCLUDE=(--exclude '.git' --exclude '.git/**' --exclude "$MARKER")
-readonly FIND_PRUNE=(-name .git -prune -o -name "$MARKER" -prune -o)
+readonly GIT_PRUNE=(-name .git -prune -o)
+readonly FIND_PRUNE=("${GIT_PRUNE[@]}" -name "$MARKER" -prune -o)
 
 # The same two exclusions plus the unit's `.ferryignore` rules, compiled by
 # load_ignore. Every reader of a unit's contents — transfer, drift check,
@@ -75,8 +76,8 @@ DRIFT=''
 DRIFT_FILES=''
 DRIFT_BASIS=''
 
-# The enclosing tree, set by in_tree: its directory, its remote base, and the
-# base's key under STATE_ROOT.
+# The enclosing tree, set by locate_tree: its directory, its remote base, and
+# the base's key under STATE_ROOT.
 ROOT=''
 BASE=''
 STATE_KEY=''
@@ -185,7 +186,7 @@ run_rclone() {
 # minutes; these fail within about a minute. Transfers keep the defaults: they
 # show progress, and their retries ride out rate limits and slow finalising.
 # Flags outrank rclone's environment, so a limit the user set there is left out.
-run_probe() {
+run_rclone_probe() {
     local -a limits=()
     [ -n "${RCLONE_CONTIMEOUT:-}" ]        || limits+=(--contimeout 15s)
     [ -n "${RCLONE_TIMEOUT:-}" ]           || limits+=(--timeout 1m)
@@ -202,7 +203,7 @@ show_rclone_log() {   # <is failure: 0|1> <log>
     if [ -n "$2" ]; then sed "s/^/$PROG: rclone: /" <<<"$2" >&2; fi
 }
 
-# run_probe with stderr held back for show_rclone_log: a probe that succeeds
+# run_rclone_probe with stderr held back for show_rclone_log: a probe that succeeds
 # stays quiet, one that fails says why. Stdout passes through.
 rclone_quiet() { rclone_expect 0 "$@"; }
 
@@ -210,7 +211,7 @@ rclone_quiet() { rclone_expect 0 "$@"; }
 # handles (rclone's 3: "not found"): its log is shown only for any other status.
 rclone_expect() {   # <expected statuses, comma-separated> <rclone args>...
     local expected=",$1," err status=0 failed=1; shift
-    { err=$(run_probe "$@" 2>&1 >&3 3>&-); } 3>&1 || status=$?
+    { err=$(run_rclone_probe "$@" 2>&1 >&3 3>&-); } 3>&1 || status=$?
     [[ $expected != *",$status,"* ]] || failed=0
     show_rclone_log "$failed" "$err"
     return "$status"
@@ -238,24 +239,37 @@ confirm() {
 # --- tree discovery (walk up) -----------------------------------------------
 # Locate the enclosing tree: the nearest ancestor (incl. $PWD) whose marker has
 # content. Sets ROOT (its directory) and BASE (the remote base). Returns 1 if
-# $PWD is not inside any tree — a predicate, so callers like `init` can branch.
-in_tree() {
-    local d; d=$(pwd -P)
+# $PWD is not inside any tree, so callers like `init` can branch; dies on a
+# root marker that holds no remote base.
+locate_tree() {
+    local dir; dir=$(pwd -P)
     while :; do
-        if [ -s "$d/$MARKER" ]; then
-            ROOT=$d
-            BASE=$(head -1 "$d/$MARKER")
+        if [ -s "$dir/$MARKER" ]; then
+            ROOT=$dir
+            IFS= read -r BASE < "$dir/$MARKER" || true
+            BASE=${BASE%$'\r'}
+            is_remote_base "$BASE" || die "$dir/$MARKER holds no remote base ('remote:path'): '$BASE'"
             STATE_KEY=$(state_key "$BASE")
             return 0
         fi
-        [ "$d" = / ] && return 1
-        d=$(dirname "$d")
+        [ "$dir" != / ] || return 1
+        dir=$(dirname "$dir")
     done
+}
+
+# True if a root marker's content is a usable remote base: "remote:path" (no
+# '/' in the remote name, else rclone reads a local path) or an rclone
+# connection string ":backend:path".
+is_remote_base() {
+    local name=${1%%:*}
+    [[ $1 == *:* ]] || return 1
+    if [ -z "$name" ]; then [[ $1 == :?*:* ]]
+    else [[ $name != */* ]]; fi
 }
 
 # Same, but die when there is no enclosing tree; also adopts legacy state.
 find_root() {
-    in_tree || die "not inside a ferry tree (no rooted $MARKER above $PWD)"
+    locate_tree || die "not inside a ferry tree (no rooted $MARKER above $PWD)"
     adopt_legacy_state
 }
 
@@ -288,7 +302,12 @@ resolve_target() {
 # --- marker-tree topology ---------------------------------------------------
 # True if a directory holds a marker in a subdirectory (depth >= 2, so its own
 # dir/.ferry does not count) — i.e. it is a grouping node, not a leaf.
-has_sub_marker() { find "$1" -mindepth 2 -name "$MARKER" -type f -print -quit | grep -q .; }
+# (`-path <dir>/*/` rather than -mindepth 2, which would keep a top-level .git
+# from being pruned.)
+has_sub_marker() {
+    [ -n "$(find "$1" "${GIT_PRUNE[@]}" \
+        -path "$(escape_find_glob "$1")/*/$MARKER" -type f -print -quit)" ]
+}
 
 # A unit = a directory with an EMPTY marker (the root marker has content) that is
 # a leaf of the marker tree.
@@ -298,18 +317,18 @@ is_unit() { [ -f "$1/$MARKER" ] && [ ! -s "$1/$MARKER" ] && ! has_sub_marker "$1
 # i.e. whether the directory sits inside already-materialized content. A unit
 # marker is empty; the root marker has content, so the root never matches.
 enclosing_unit() {
-    local d=$1
-    while [ "$d" != / ] && [ "$d" != "$ROOT" ]; do
-        if [ -f "$d/$MARKER" ] && [ ! -s "$d/$MARKER" ]; then printf '%s' "$d"; return 0; fi
-        d=$(dirname "$d")
+    local dir=$1
+    while [ "$dir" != / ] && [ "$dir" != "$ROOT" ]; do
+        if [ -f "$dir/$MARKER" ] && [ ! -s "$dir/$MARKER" ]; then printf '%s' "$dir"; return 0; fi
+        dir=$(dirname "$dir")
     done
     return 1
 }
 
 # Refuse to create/fetch a target that would sit inside an existing unit.
 refuse_in_unit() {
-    local u; if u=$(enclosing_unit "$(dirname "$1")"); then
-        die "inside unit '$(spec_of "$u")' — already materialized content"
+    local unit; if unit=$(enclosing_unit "$(dirname "$1")"); then
+        die "inside unit '$(spec_of "$unit")' — already materialized content"
     fi
 }
 
@@ -340,24 +359,25 @@ transfer_target() {
 # Refuse to act on a path the shell is standing inside (a move/delete would
 # leave $PWD on a dead directory).
 refuse_cwd_inside() {
-    local here tgt; here=$(pwd -P)
-    tgt=$(cd "$1" 2>/dev/null && pwd -P || printf '%s' "$1")
-    case "$here/" in "$tgt/"*) die "cd out of $1 first" ;; esac
+    local here target; here=$(pwd -P)
+    target=$(cd "$1" 2>/dev/null && pwd -P || printf '%s' "$1")
+    case "$here/" in "$target/"*) die "cd out of $1 first" ;; esac
 }
 
 # Every unit at/under a directory (walk down): EMPTY-marker dirs (the root's
 # content marker is excluded by -empty) with no marker dir below them. One line
 # per absolute unit path.
 units_under() {
-    local -a mdirs; mapfile -t mdirs < <(find "$1" -name "$MARKER" -type f -empty -printf '%h\n' | sort)
-    local d e leaf
-    for d in "${mdirs[@]}"; do
+    local -a marker_dirs; local dir other leaf
+    mapfile -t marker_dirs < <(find "$1" "${GIT_PRUNE[@]}" \
+        -name "$MARKER" -type f -empty -printf '%h\n' | sort)
+    for dir in "${marker_dirs[@]}"; do
         leaf=1
-        for e in "${mdirs[@]}"; do
-            [ "$e" = "$d" ] && continue
-            case "$e/" in "$d/"*) leaf=0; break ;; esac
+        for other in "${marker_dirs[@]}"; do
+            [ "$other" = "$dir" ] && continue
+            case "$other/" in "$dir/"*) leaf=0; break ;; esac
         done
-        [ "$leaf" = 1 ] && printf '%s\n' "$d"
+        [ "$leaf" = 1 ] && printf '%s\n' "$dir"
     done
 }
 
@@ -367,11 +387,8 @@ units_under() {
 # unit) and one in each unit; both are read RELATIVE TO THE UNIT, so a rule
 # written at the root anchors at each unit's own top.
 #
-# `.gitignore` is deliberately NOT consulted. "Do not version-control this" is a
-# different question from "do not back this up" — ferry exists for the large and
-# private files git is told to skip, and `bundle_git` writes `history.bundle`
-# into `.gitignore` itself, so honouring it would silently stop backing up git
-# history.
+# `.gitignore` is deliberately not consulted (see ARCHITECTURE.md, "Ignore
+# rules"): not versioning a file is a different question from not backing it up.
 #
 # The grammar is restricted to what `find` and rclone match IDENTICALLY, because
 # both must apply it (see UNIT_EXCLUDE). Blank lines and `#` comments are
@@ -386,8 +403,8 @@ units_under() {
 # `{a,b}` alternation and `[!...]` negation (rclone reads them, `find` does not
 # or reads them differently), `**` (a bare name already matches at any depth),
 # and an unanchored `a/b` (gitignore anchors it, rclone does not — so it must
-# be written `/a/b`). An anchored pattern must be literal: `find -path` lets `*` cross a `/` and rclone
-# does not, so a glob there would mean two different things.
+# be written `/a/b`). An anchored pattern must be literal: `find -path` lets
+# `*` cross a `/` and rclone does not, so a glob there would mean two things.
 
 # Quote the characters `find -path` reads as glob metacharacters, so a literal
 # directory prefix never turns into a pattern.
@@ -414,7 +431,8 @@ compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
     local file=$1 dir=$2 line pat dironly
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line%$'\r'}
-        case $line in ''|'#'*) continue ;; esac
+        case $line in '#'*|*[![:space:]]*) ;; *) continue ;; esac   # blank
+        case $line in '#'*) continue ;; esac
 
         pat=$line dironly=0
         case $pat in */) dironly=1; pat=${pat%/} ;; esac
@@ -424,6 +442,7 @@ compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
             *'**'*) die "$file: '$line' — '**' is not supported; a bare name already matches at any depth" ;;
             *[{}]*) die "$file: '$line' — '{a,b}' alternation is not supported; write one pattern per line" ;;
             *'[!'*) die "$file: '$line' — '[!...]' is not supported; write the negation as '[^...]'" ;;
+            *[[:space:]]) die "$file: '$line' — trailing whitespace would be part of the pattern" ;;
         esac
 
         if [[ $pat == */* ]]; then
@@ -459,21 +478,21 @@ compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
 # A load with a remote always runs: an earlier local-only load of the same unit
 # (sync, before it hands a first pull over) left the cloud's rules out.
 load_ignore() {   # <unit dir> [<remote>]
-    local dir=$1 rp=${2:-} f rules status=0
-    [ -n "$rp" ] || [ "$IGNORE_LOADED" != "$dir" ] || return 0
+    local dir=$1 remote_path=${2:-} unit_rules rules status=0
+    [ -n "$remote_path" ] || [ "$IGNORE_LOADED" != "$dir" ] || return 0
     UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
     UNIT_PRUNE=("${FIND_PRUNE[@]}")
     if [ -n "$ROOT" ] && [ -f "$ROOT/$IGNORE_FILE" ]; then
         compile_ignore "$ROOT/$IGNORE_FILE" "$dir" < "$ROOT/$IGNORE_FILE"
     fi
-    f=$dir/$IGNORE_FILE
-    if [ -f "$f" ]; then
-        compile_ignore "$f" "$dir" < "$f"
-    elif [ -n "$rp" ]; then
+    unit_rules=$dir/$IGNORE_FILE
+    if [ -f "$unit_rules" ]; then
+        compile_ignore "$unit_rules" "$dir" < "$unit_rules"
+    elif [ -n "$remote_path" ]; then
         # rclone answers 3 for a missing file and for a missing prefix alike.
-        rules=$(rclone_expect 0,3 cat "$rp/$IGNORE_FILE") || status=$?
+        rules=$(rclone_expect 0,3 cat "$remote_path/$IGNORE_FILE") || status=$?
         case $status in
-            0) compile_ignore "$rp/$IGNORE_FILE" "$dir" <<<"$rules" ;;
+            0) compile_ignore "$remote_path/$IGNORE_FILE" "$dir" <<<"$rules" ;;
             3) ;;
             *) return 1 ;;
         esac
@@ -487,7 +506,7 @@ load_ignore() {   # <unit dir> [<remote>]
 # confident "nothing on the cloud". rclone answers "directory not found" (3) both
 # for a path that is not there and for one behind an unreadable parent, so those
 # two stay conflated; every other failure is reported as trouble.
-remote_state() {
+remote_presence() {
     local status=0
     rclone_expect 0,3 lsjson "$1" >/dev/null || status=$?
     case $status in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
@@ -501,11 +520,11 @@ remote_state() {
 # to the mtime fallback for a whole sync cycle.
 remote_hash_type() {
     [ "$HASH_PROBED" = 1 ] && return 0
-    local out flat h=''
+    local out flat hash=''
     out=$(rclone_quiet backend features "$BASE") || return 1
     flat=$(tr -d '\n\t" ' <<<"$out")
-    case $flat in *Hashes:\[*) h=${flat#*Hashes:[}; h=${h%%]*}; h=${h%%,*} ;; esac
-    HASH_TYPE=$h HASH_PROBED=1
+    case $flat in *Hashes:\[*) hash=${flat#*Hashes:[}; hash=${hash%%]*}; hash=${hash%%,*} ;; esac
+    HASH_TYPE=$hash HASH_PROBED=1
 }
 
 # State is keyed by the remote base as well as the unit path. Two trees can hold
@@ -579,11 +598,11 @@ remote_hashes() {   # <hash type> <remote>
 # file the backend holds no hash for is printed with a blank hash and skipped;
 # a hash is bare hex, so its first double space always ends it.
 read_hashes() {   # <map name>
-    local -n into=$1; local line h
+    local -n into=$1; local line hash
     while IFS= read -r line; do
-        h=${line%%  *}
-        case $h in ''|*[!0-9a-f]*) continue ;; esac
-        into[${line#*  }]=$h
+        hash=${line%%  *}
+        case $hash in ''|*[!0-9a-f]*) continue ;; esac
+        into[${line#*  }]=$hash
     done
 }
 
@@ -613,7 +632,7 @@ list_side() {   # <local|remote> <dir or remote> [<hash type>]
 
 # A manifest headed by its version and hash type, over "<hash> <path>" lines.
 # 'none' spells the empty hash type only here and in read_manifest.
-manifest_v2() { printf '#ferry v2 %s\n%s' "${1:-none}" "$2"; }
+format_manifest() { printf '#ferry v2 %s\n%s' "${1:-none}" "$2"; }
 
 # Read a manifest into the named variables: its hash type, and path → 1 /
 # path → ancestor hash maps. v2 gives membership and ancestor hashes; a v1
@@ -649,28 +668,21 @@ intersect_manifest() {   # <paths> <manifest body>
     done <<<"$2"
 }
 
-# Record a sync point for a unit: the baseline mtime the mtime fallback
-# measures drift from, a prompt bit ($3, 'sync' unless the caller still holds
-# conflicts), and the MANIFEST of ancestors — the paths (with content hashes,
-# in a v2 manifest) present on BOTH sides at that sync.
-#
-# The manifest is the ancestor set. Without it a file on only one side cannot
-# be attributed: "I deleted it" and "they added it" look identical from the
-# surviving copy alone, and guessing calls a file pushed late from another
-# machine a local deletion, which `--mirror` then acts on.
-#
-# The manifest's paths are captured BEFORE the transfer and installed only once
-# it succeeds: taken afterwards they would enrol a file written *during* the
-# transfer, which never crossed. The baseline is stamped at completion, because
-# the sync's own writes — the marker, a restored .git, and on backends that
-# cannot set a destination modtime the transferred objects themselves — all
-# land after the start and would otherwise read as post-sync changes.
-mark_synced() {
-    local spec=$1 manifest=$2 bit=${3:-sync} sd; sd=$(state_path "$spec"); mkdir -p "$sd"
-    if [ -n "$manifest" ]; then printf '%s\n' "$manifest" > "$sd/$MANIFEST"
-    else : > "$sd/$MANIFEST"; fi
-    : > "$sd/$BASELINE"          # touched last: newer than everything it covers
-    record_remote_bit "$sd" "$bit"
+# Record a sync point for a unit: the MANIFEST of ancestors (the paths, with
+# hashes in a v2 manifest, present on BOTH sides at this sync), a prompt bit
+# ($3, 'sync' unless the caller still holds conflicts), and the baseline whose
+# mtime the mtime fallback measures from. Callers capture the manifest's paths
+# BEFORE their transfer; the baseline is stamped here, at completion, so the
+# sync's own writes never read as later changes. The manifest is replaced
+# atomically. See ARCHITECTURE.md, "Drift classification".
+mark_synced() {   # <spec> <manifest> [<prompt bit>]
+    local manifest=$2 bit=${3:-sync} state_dir
+    state_dir=$(state_path "$1")
+    mkdir -p "$state_dir" || return 1
+    { printf '%s\n' "$manifest" > "$state_dir/$MANIFEST.tmp" &&
+      mv "$state_dir/$MANIFEST.tmp" "$state_dir/$MANIFEST"; } || return 1
+    : > "$state_dir/$BASELINE"          # touched last: newer than everything it covers
+    record_remote_bit "$state_dir" "$bit"
 }
 
 # True if any unit at or under a node shared a file with the cloud at its last
@@ -694,68 +706,27 @@ side_changed() {   # <current hash> <ancestor hash> <moved past baseline: 1 or '
     else [ -n "$3" ]; fi
 }
 
-# Per-file drift for a unit, one "<class> <shape> <path>" line per differing file:
+# Which files of a unit differ from the cloud: `rclone check --combined` lines,
+# "<flag> <path>" with flag + (local only), - (cloud only), * (differs) or !
+# (unreadable); identical files are left out. Returns non-zero, printing
+# rclone's log, when anything went unread.
 #
-#   local   changed here since the last sync — a push carries it up
-#   remote  changed on the cloud             — a pull brings it down
-#   both    changed on both sides            — a conflict; neither is safe
-#
-# Direction cannot come from the diff: two content checks share no common
-# ancestor, so they cannot tell "I changed it" from "we both changed it". The
-# ancestor is the MANIFEST. Its membership answers presence questions — whether
-# a one-sided file left one side or arrived on the other is visible in nothing
-# the surviving copy carries, and a directory's mtime is too coarse to stand in
-# (one unrelated add stamps it for every file). Its recorded hashes answer
-# content questions: a side changed a file iff its current hash differs from
-# the ancestor's — immune to the mtimes transfers preserve (a file edited on
-# another machine before our baseline and pushed after it arrives with a
-# pre-baseline mtime, yet is still a cloud change).
-#
-# Where a hash is missing (a v1 manifest, a backend entry without one) the
-# fallback is mtimes against the baseline ($base, whose mtime is the last sync
-# point): rclone preserves source mtimes on transfer, so right after a sync
-# both sides predate the baseline and only later writes stand out. The cutoff
-# is strict and keeps full precision — truncated to the second it would catch
-# the sync's own tail writes, landing in the baseline's second, as far-side
-# changes. `find -newer` applies the same strict comparison locally.
-#
-# The shape says how the file differs, and it is what decides whether a
-# transfer can *destroy* anything: only a file present on both sides ('edit')
-# is ever overwritten by a copy.
-#
-#   *  differs      edit;   one side changed → that side | else → both
-#   +  local-only   not in manifest → local add | changed here → both delete | else remote delete
-#   -  remote-only  not in manifest → remote add | changed there → both delete | else local delete
-#
-# A file rclone could not read ('!') is reported 'both edit': what is unknown blocks.
-# Returns non-zero if the cloud could not be read — the caller must not read that
-# as "no differences" (see probe_unit).
-classify_unit() {
-    local dir=$1 rp=$2 sd=$3 base=$3/$BASELINE
-    local -A synced=() ancestor=() lmoved=() lhash=() rmoved=() rhash=()
-    local manifest_type line flag cls shape p a i lch rch
-    load_ignore "$dir"
-    read_manifest "$sd/$MANIFEST" manifest_type synced ancestor
-
-    # rclone exits 1 both for "differences found" (the normal case here) and for
-    # trouble, and downgrades a directory it could not list to a stderr tally
-    # while still reporting that whole subtree as missing on the far side — which
-    # would forge a presence change. Its error counter tallies each difference
-    # *plus* each real failure, so an excess over the difference count is the
-    # signal that something went unread — and a summary the counters cannot be
-    # read from is itself trouble, never a clean diff. Report and log share one
-    # stream so neither needs a temp file: every report line is "<flag> <path>",
-    # every log line starts with rclone's timestamp.
-    # --log-format pinned: the summary parse below keys on the timestamp
-    # prefix, and a user's RCLONE_LOG_FORMAT would otherwise change it.
+# rclone exits 1 both for "differences found" and for trouble, and reports a
+# directory it could not list as a whole subtree missing on the far side — a
+# forged presence change. Its error counter tallies each difference plus each
+# real failure, so an excess over the difference count means something went
+# unread, and a summary the counters cannot be read from is trouble too. Report
+# and log share one stream: a report line is "<flag> <path>", a log line starts
+# with rclone's timestamp — pinned by --log-format against RCLONE_LOG_FORMAT.
+check_differences() {   # <dir> <remote>
     local output status=0 differences errors trouble=0
-    output=$(run_probe check --combined - --log-format 'date,time' \
-        "${UNIT_EXCLUDE[@]}" "$dir" "$rp" 2>&1) || status=$?
+    output=$(run_rclone_probe check --combined - --log-format 'date,time' \
+        "${UNIT_EXCLUDE[@]}" "$1" "$2" 2>&1) || status=$?
     if [ "$status" -gt 1 ]; then trouble=1
     elif [ "$status" = 1 ]; then
         # Counters come only from the timestamped NOTICE summary lines, matched
-        # to the line's end — a report line is "<flag> <path>", and a path such
-        # as "0 errors while checking.txt" could otherwise spoof them.
+        # to the line's end — a path such as "0 errors while checking.txt"
+        # could otherwise spoof them.
         differences=$(sed -nE \
             's|^[0-9]{4}/.* NOTICE: .*[^0-9]([0-9]+) differences found$|\1|p' \
             <<<"$output" | tail -1)
@@ -766,90 +737,112 @@ classify_unit() {
     fi
     show_rclone_log "$trouble" "$(sed -nE '/^[0-9]{4}\//p' <<<"$output")"
     [ "$trouble" = 0 ] || return 1
+    grep -E '^[-+*!] ' <<<"$output" || true
+}
 
-    # One pass over the report — the "<flag> <path>" grammar is parsed only
-    # here (a path may hold spaces; '=' lines are identical files).
+# Per-file drift for a unit, one "<class> <shape> <path>" line per differing
+# file. Class: `local` (changed here since the last sync), `remote` (changed on
+# the cloud) or `both` (a conflict). Shape: `edit` (on both sides) or
+# `add`/`delete` (one side only) — what a transfer could destroy.
+#
+# Direction is relative to the last sync: a side changed a file iff its hash
+# differs from the manifest's ancestor hash, falling back to its mtime against
+# the baseline where a hash is missing. A one-sided file is attributed by
+# manifest membership, never by mtimes. What is unknown — an unreadable file
+# ('!'), a difference neither side's hash explains — reads `both`, so it
+# blocks. The full rule tables are in ARCHITECTURE.md, "Drift classification".
+#
+# Returns non-zero if the cloud could not be read; the caller must not read
+# that as "no differences" (see probe_unit).
+classify_unit() {
+    local dir=$1 remote_path=$2 state_dir=$3 baseline=$3/$BASELINE
+    local -A synced=() ancestor=() local_moved=() local_hash=() remote_moved=() remote_hash=()
+    local manifest_type line flag class shape path ancestor_hash index local_changed remote_changed
+    load_ignore "$dir"
+    read_manifest "$state_dir/$MANIFEST" manifest_type synced ancestor
+
+    local report
+    report=$(check_differences "$dir" "$remote_path") || return 1
+
+    # Split each "<flag> <path>" line (a path may hold spaces).
     local -a flags=() paths=()
     local -A flagged=()
     while IFS= read -r line; do
-        case $line in [-+*!]' '*) ;; *) continue ;; esac
+        [ -n "$line" ] || continue
         flags+=("${line:0:1}"); paths+=("${line:2}"); flagged[${line:2}]=1
-    done <<<"$output"
+    done <<<"$report"
     [ ${#paths[@]} -gt 0 ] || return 0    # nothing differs: no listing to consult
     step "${#paths[@]} file(s) differ"
 
-    while IFS= read -r p; do lmoved[$p]=1; done < <(
-        find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$base" -printf '%P\n')
+    while IFS= read -r path; do local_moved[$path]=1; done < <(
+        find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$baseline" -printf '%P\n')
 
     # The remote listing carries every cloud file's mtime (the fallback); only
     # the flagged files are ever consulted, so only they are kept. Times compare
-    # as strings: 'max' keeps the fixed "Y-m-d H:M:S.ns" layout, where
-    # lexicographic and chronological order agree, and the baseline cutoff
-    # keeps the same precision.
+    # as strings: 'max' is "Y-m-d H:M:S.ns" with trailing fraction zeros
+    # trimmed, which keeps lexicographic order chronological against the
+    # full-precision cutoff.
     local cutoff listing
-    cutoff=$(TZ=UTC date '+%Y-%m-%d %H:%M:%S.%N' -r "$base")
-    listing=$(remote_listing "$rp") || return 1
+    cutoff=$(TZ=UTC date '+%Y-%m-%d %H:%M:%S.%N' -r "$baseline")
+    listing=$(remote_listing "$remote_path") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        p=${line#*;}
-        [ -n "${flagged[$p]:-}" ] || continue
-        [[ ${line%%;*} > $cutoff ]] && rmoved[$p]=1
+        path=${line#*;}
+        [ -n "${flagged[$path]:-}" ] || continue
+        [[ ${line%%;*} > $cutoff ]] && remote_moved[$path]=1
     done <<<"$listing"
 
-    # Current hashes (the primary evidence) — only for flagged files with an
-    # ancestor hash to compare against, and only on the side whose change
-    # decides that flag: hashing is O(content) locally and may cost a request
-    # per file on the cloud, so never the whole unit. An ancestor hash implies
-    # a v2 manifest, so manifest_type is set here. A cloud lookup that fails is
-    # trouble like a failed listing; a local one leaves that side on the mtime
-    # fallback.
-    local -a lneed=() rneed=()
-    for i in "${!paths[@]}"; do
-        [ -n "${ancestor[${paths[$i]}]:-}" ] || continue
-        case ${flags[$i]} in
-            '*') lneed+=("${paths[$i]}"); rneed+=("${paths[$i]}") ;;
-            '+') lneed+=("${paths[$i]}") ;;
-            '-') rneed+=("${paths[$i]}") ;;
+    # Current hashes, the primary evidence: only flagged files with an ancestor
+    # hash (so a v2 manifest and its type), only on the side that decides the
+    # flag. A failed cloud lookup is trouble; a failed local one falls back to
+    # mtimes.
+    local -a local_needed=() remote_needed=()
+    for index in "${!paths[@]}"; do
+        [ -n "${ancestor[${paths[$index]}]:-}" ] || continue
+        case ${flags[$index]} in
+            '*') local_needed+=("${paths[$index]}"); remote_needed+=("${paths[$index]}") ;;
+            '+') local_needed+=("${paths[$index]}") ;;
+            '-') remote_needed+=("${paths[$index]}") ;;
         esac
     done
-    if [ ${#rneed[@]} -gt 0 ]; then
-        step "reading ${#rneed[@]} cloud hash(es)"
+    if [ ${#remote_needed[@]} -gt 0 ]; then
+        step "reading ${#remote_needed[@]} cloud hash(es)"
         local sums
-        sums=$(printf '%s\n' "${rneed[@]}" | hash_paths "$manifest_type" "$rp") || return 1
-        read_hashes rhash <<<"$sums"
+        sums=$(printf '%s\n' "${remote_needed[@]}" | hash_paths "$manifest_type" "$remote_path") || return 1
+        read_hashes remote_hash <<<"$sums"
     fi
-    if [ ${#lneed[@]} -gt 0 ]; then
-        step "hashing ${#lneed[@]} local file(s)"
-        read_hashes lhash < <(printf '%s\n' "${lneed[@]}" | hash_paths "$manifest_type" "$dir")
+    if [ ${#local_needed[@]} -gt 0 ]; then
+        step "hashing ${#local_needed[@]} local file(s)"
+        read_hashes local_hash < <(printf '%s\n' "${local_needed[@]}" | hash_paths "$manifest_type" "$dir")
     fi
 
-    for i in "${!paths[@]}"; do
-        flag=${flags[$i]} p=${paths[$i]} shape=edit a=${ancestor[$p]:-}
-        lch=0; side_changed "${lhash[$p]:-}" "$a" "${lmoved[$p]:-}" && lch=1
-        rch=0; side_changed "${rhash[$p]:-}" "$a" "${rmoved[$p]:-}" && rch=1
+    for index in "${!paths[@]}"; do
+        flag=${flags[$index]} path=${paths[$index]} shape=edit ancestor_hash=${ancestor[$path]:-}
+        local_changed=0; side_changed "${local_hash[$path]:-}" "$ancestor_hash" "${local_moved[$path]:-}" && local_changed=1
+        remote_changed=0; side_changed "${remote_hash[$path]:-}" "$ancestor_hash" "${remote_moved[$path]:-}" && remote_changed=1
         case "$flag" in
-            '*') case "$lch$rch" in
-                     10) cls=local ;; 01) cls=remote ;; *) cls=both ;;    # 00: unattributable
+            '*') case "$local_changed$remote_changed" in
+                     10) class=local ;; 01) class=remote ;; *) class=both ;;    # 00: unattributable
                  esac ;;
             '+') shape=delete
-                 if [ -z "${synced[$p]:-}" ]; then cls=local shape=add    # not shared last sync
-                 elif [ "$lch" = 1 ]; then cls=both                       # edited here, dropped there
-                 else cls=remote; fi ;;                                   # the cloud dropped it
+                 if [ -z "${synced[$path]:-}" ]; then class=local shape=add      # not shared last sync
+                 elif [ "$local_changed" = 1 ]; then class=both               # edited here, dropped there
+                 else class=remote; fi ;;                                     # the cloud dropped it
             '-') shape=delete
-                 if [ -z "${synced[$p]:-}" ]; then cls=remote shape=add   # never here: it arrived there
-                 elif [ "$rch" = 1 ]; then cls=both                       # deleted here, changed there
-                 else cls=local; fi ;;                                    # deleted here
-            '!') cls=both ;;
+                 if [ -z "${synced[$path]:-}" ]; then class=remote shape=add     # never here: it arrived there
+                 elif [ "$remote_changed" = 1 ]; then class=both              # deleted here, changed there
+                 else class=local; fi ;;                                      # deleted here
+            '!') class=both ;;
         esac
-        printf '%s %s %s\n' "$cls" "$shape" "$p"
+        printf '%s %s %s\n' "$class" "$shape" "$path"
     done
 }
 
 # Fold classification lines (stdin) into the two drift bits, "<up><down>".
 drift_bits() {
-    local up=0 down=0 cls
-    while read -r cls _; do
-        case "$cls" in
+    local up=0 down=0 class
+    while read -r class _; do
+        case "$class" in
             local)  up=1 ;;
             remote) down=1 ;;
             both)   up=1; down=1 ;;
@@ -864,21 +857,21 @@ drift_symbol() {
     case "$1" in 00) printf '=' ;; 10) printf '>' ;; 01) printf '<' ;; 11) printf '<>' ;; esac
 }
 
-# Split one classification line into the caller's cls / shape / path — the
+# Split one classification line into the caller's class / shape / path — the
 # only parser of classify_unit's output grammar. Split by hand rather than by
 # `read` word-splitting, which eats leading spaces in the path.
 drift_fields() {
-    cls=${1%% *}; local rest=${1#* }
+    class=${1%% *}; local rest=${1#* }
     shape=${rest%% *}; path=${rest#* }
 }
 
 # Render a classification block: one indented "<class> <shape> <path>" per
 # line, sorted.
 print_drift_files() {
-    local line cls shape path
+    local line class shape path
     while IFS= read -r line; do
         drift_fields "$line"
-        printf '    %-6s %-6s %s\n' "$cls" "$shape" "$path"
+        printf '    %-6s %-6s %s\n' "$class" "$shape" "$path"
     done < <(sort <<<"$1")
 }
 
@@ -887,12 +880,12 @@ print_drift_files() {
 # guard need both halves, and a command substitution would lose the second.
 # DRIFT is '?' when the cloud could not be read — never a confident symbol.
 probe_unit() {
-    local dir=$1 rp sd base bits reachable=0
-    rp=$(remote_of "$dir"); sd=$(state_path "$(spec_of "$dir")"); base=$sd/$BASELINE
+    local dir=$1 remote_path state_dir baseline bits reachable=0
+    remote_path=$(remote_of "$dir"); state_dir=$(state_path "$(spec_of "$dir")"); baseline=$state_dir/$BASELINE
     DRIFT_FILES=''
 
     step 'comparing with the cloud'
-    remote_state "$rp" || reachable=$?
+    remote_presence "$remote_path" || reachable=$?
     if [ "$reachable" = 2 ]; then
         DRIFT='?' DRIFT_BASIS=unreadable; return 0    # see the '?' note below
     elif [ "$reachable" = 1 ]; then
@@ -900,8 +893,8 @@ probe_unit() {
         # that cannot hold empty dirs): local content is unpushed, empty is in sync.
         DRIFT_BASIS=absent
         if has_local_content "$dir"; then bits=10; else bits=00; fi
-    elif [ -d "$dir" ] && [ -e "$base" ] && [ -e "$sd/$MANIFEST" ]; then
-        if DRIFT_FILES=$(classify_unit "$dir" "$rp" "$sd"); then
+    elif [ -d "$dir" ] && [ -e "$baseline" ] && [ -e "$state_dir/$MANIFEST" ]; then
+        if DRIFT_FILES=$(classify_unit "$dir" "$remote_path" "$state_dir"); then
             DRIFT_BASIS=compared
             bits=$(drift_bits <<<"$DRIFT_FILES")
         else
@@ -921,34 +914,28 @@ probe_unit() {
     # Keep the prompt's cloud bit fresh. It stores 'diverged' rather than folding
     # it into 'behind' so the conservative half of a '<>' survives: the prompt's
     # own local check is mtime-only and cannot see a same-mtime conflict.
-    mkdir -p "$sd"
+    mkdir -p "$state_dir"
     case "$bits" in
-        11) record_remote_bit "$sd" diverged ;;
-        01) record_remote_bit "$sd" behind ;;
-        *)  record_remote_bit "$sd" sync ;;
+        11) record_remote_bit "$state_dir" diverged ;;
+        01) record_remote_bit "$state_dir" behind ;;
+        *)  record_remote_bit "$state_dir" sync ;;
     esac
 }
 
-# Move bytes src -> dst, excluding git internals and markers. mirror=1 propagates
-# deletions (rclone sync); otherwise additive (rclone copy).
+# Move bytes src -> dst, excluding git internals and markers. MIRROR=1
+# propagates deletions (rclone sync); otherwise additive (rclone copy).
 #
-# Filter and skip rule differ by shape. Whole tree: the usual exclusions, and
-# --checksum whenever hashes drive attribution — rclone's default skip
-# (size+modtime) would leave a same-size preserved-mtime edit untransferred
-# while its hash is recorded as the shared ancestor, arming a later
-# guard-approved transfer to overwrite the unseen edit; with --checksum,
-# "skipped" means "identical", which is what mark_synced records. A path list
-# ($3, newline-separated): every listed file is known to differ or be
-# one-sided, so the copy is inevitable — --ignore-times forces it instead of
-# re-verifying. rclone refuses every other filter beside --files-from-raw (raw:
-# the plain variant reads '#'/';' names as comments), which is safe here: the
-# lists come from a classification that already ran under UNIT_EXCLUDE, so
-# nothing ignored can reach one.
+# Whole tree: the unit's exclusions, plus --checksum when the remote has
+# hashes — the default size+modtime skip could leave a same-size edit behind
+# while its hash is recorded as shared. A path list ($3, newline-separated):
+# every listed file is known to differ, so --ignore-times forces the copy.
+# rclone takes no other filter beside --files-from-raw ('raw': the plain form
+# reads '#'/';' names as comments); the lists come from a classification that
+# already applied the exclusions.
 #
-# Progress: live on a terminal; elsewhere (a log, a pipe) --progress would
-# write redraw codes, so a one-line summary every 10s instead, raised to NOTICE
-# so it prints without -v. The direction is read off src: remote paths are
-# always under $BASE.
+# Progress: live on a terminal, else a one-line NOTICE summary every 10s. The
+# direction is read off src: remote paths always start with $BASE. See
+# ARCHITECTURE.md, "Sync model".
 transfer() {
     local src=$1 dst=$2 files=${3:-} verb=copy way=uploading count=''
     [ "$MIRROR" = 1 ] && verb=sync
@@ -1031,22 +1018,13 @@ bundle_git() {
     fi
 }
 
-# --- transfer guard ---------------------------------------------------------
-# Refuse a transfer that would destroy what the other side changed since the last
-# sync — git's non-fast-forward refusal, and the payoff for making '<>' mean
-# something. What each mode can destroy differs, so the rule does too:
-#
-#   plain copy  overwrites only files that exist on BOTH sides, so an 'edit' on
-#               the far side is the whole hazard. A file added or deleted on one
-#               side is untouchable by it — which is why deleting a file locally
-#               does not stand in the way of pulling (the pull simply brings it
-#               back), and why an unpushed new file does not either.
-#   --mirror    also deletes on the far side, so any far-side change counts and
-#               the transfer must run with the drift.
-#
-# Costs one probe per unit, which --force skips along with the block itself.
+# Refuse a transfer that would destroy what the other side changed since the
+# last sync, git's non-fast-forward refusal. A plain copy only overwrites files
+# on both sides, so only a far-side `edit` blocks it; --mirror also deletes, so
+# every far-side change blocks it. Costs one probe, which --force skips with the
+# block. See ARCHITECTURE.md, "Transfer guard".
 guard_transfer() {
-    local verb=$1 dir=$2 reason='' line cls shape path
+    local verb=$1 dir=$2 reason='' line class shape path
     [ "$FORCE" = 1 ] && return 0
     probe_unit "$dir"
 
@@ -1061,10 +1039,10 @@ guard_transfer() {
     if [ -z "$reason" ]; then
         while IFS= read -r line; do
             drift_fields "$line"
-            case "$cls" in "$far"|both) ;; *) continue ;; esac
+            case "$class" in "$far"|both) ;; *) continue ;; esac
             if [ "$MIRROR" = 1 ] || [ "$shape" = edit ]; then
                 blocking+=("$path")
-                [ "$cls" = both ] && saw_both=1
+                [ "$class" = both ] && saw_both=1
             fi
         done <<<"$DRIFT_FILES"
         if [ ${#blocking[@]} -gt 0 ]; then
@@ -1098,17 +1076,17 @@ pull_unit() {
 # The transfer half of a pull, once the guard has passed and the cloud's rules
 # are loaded.
 fetch_unit() {
-    local dir=$1 rp manifest; rp=$(remote_of "$dir")
+    local dir=$1 remote_path manifest; remote_path=$(remote_of "$dir")
     # An additive pull leaves cloud ⊆ local, so the cloud's list — hashes
     # included — is the set the two sides will share. A listing that fails must
     # fail the transfer, not quietly record an empty ancestor set.
     remote_hash_type || return 1
-    manifest=$(list_side remote "$rp" "$HASH_TYPE") || return 1
+    manifest=$(list_side remote "$remote_path" "$HASH_TYPE") || return 1
     mkdir -p "$dir" || return 1
-    transfer "$rp" "$dir" || return 1
+    transfer "$remote_path" "$dir" || return 1
     claim_unit "$dir" || return 1
     restore_git "$dir"
-    mark_synced "$(spec_of "$dir")" "$(manifest_v2 "$HASH_TYPE" "$manifest")"
+    mark_synced "$(spec_of "$dir")" "$(format_manifest "$HASH_TYPE" "$manifest")"
 }
 
 push_unit() {
@@ -1122,45 +1100,43 @@ push_unit() {
 
 # The transfer half of a push, once the guard has passed and the bundle is fresh.
 send_unit() {
-    local dir=$1 rp paths; rp=$(remote_of "$dir")
+    local dir=$1 remote_path paths; remote_path=$(remote_of "$dir")
     # An additive push leaves local ⊆ cloud, so the local list is the shared
     # set: its paths captured BEFORE the transfer, their hashes read AFTER —
-    # exactly sync_point's recipe.
+    # exactly record_sync_point's recipe.
     paths=$(list_side local "$dir") || return 1
-    transfer "$dir" "$rp" || return 1
+    transfer "$dir" "$remote_path" || return 1
     claim_unit "$dir" || return 1
-    sync_point "$rp" "$(spec_of "$dir")" "$paths"
+    record_sync_point "$remote_path" "$(spec_of "$dir")" "$paths"
 }
 
-# Record the post-sync ancestors: what the cloud now shares with local — the
-# remote listing intersected with the caller's pre-transfer path list, so a
-# file that arrived on either side *during* the sync never enrols. An empty
-# list short-circuits: nothing is shared, and there may be no remote prefix to
-# list (an empty unit's push creates none). Still-conflicted paths keep their
-# previous ancestor line instead of the cloud's current hash: both sides still
-# differ from it, so they keep reading 'both' and `resolve` keeps working
-# across syncs — and the prompt bit records 'diverged', never a clean 'sync'.
-sync_point() {   # <remote> <spec> <shared paths> [<conflicted path>...]
-    local rp=$1 spec=$2 shared=$3; shift 3
+# Record the post-sync ancestors: the remote listing intersected with the
+# paths the caller captured before its transfer (so a file that arrived during
+# the sync never enrols), under a fresh baseline. An empty path list skips the
+# listing: nothing is shared, and there may be no remote prefix to list.
+# Still-conflicted paths keep their previous ancestor line, so they keep
+# reading `both` and the prompt bit stays 'diverged'.
+record_sync_point() {   # <remote> <spec> <shared paths> [<conflicted path>...]
+    local remote_path=$1 spec=$2 shared=$3; shift 3
     remote_hash_type || return 1
-    local body='' line p
+    local body='' line path
     if [ -n "$shared" ]; then
-        body=$(list_side remote "$rp" "$HASH_TYPE") || return 1
+        body=$(list_side remote "$remote_path" "$HASH_TYPE") || return 1
         body=$(intersect_manifest "$shared" "$body")
     fi
     if [ $# -gt 0 ]; then
-        local -A synced=() ancestor=() confl=(); local manifest_type out=''
+        local -A synced=() ancestor=() conflicted=(); local manifest_type out=''
         read_manifest "$(state_path "$spec")/$MANIFEST" manifest_type synced ancestor
-        for p in "$@"; do confl[$p]=1; done
+        for path in "$@"; do conflicted[$path]=1; done
         while IFS= read -r line; do
             [ -n "$line" ] || continue
-            [ -n "${confl[${line#* }]:-}" ] || out+=$line$'\n'
+            [ -n "${conflicted[${line#* }]:-}" ] || out+=$line$'\n'
         done <<<"$body"
-        for p in "$@"; do out+="${ancestor[$p]:-} $p"$'\n'; done
+        for path in "$@"; do out+="${ancestor[$path]:-} $path"$'\n'; done
         body=${out%$'\n'}
     fi
     local bit=sync; [ $# -eq 0 ] || bit=diverged
-    mark_synced "$spec" "$(manifest_v2 "$HASH_TYPE" "$body")" "$bit"
+    mark_synced "$spec" "$(format_manifest "$HASH_TYPE" "$body")" "$bit"
 }
 
 # Converge a unit with the cloud: carry each side's changes to the other in
@@ -1169,7 +1145,7 @@ sync_point() {   # <remote> <spec> <shared paths> [<conflicted path>...]
 # --mirror). A file changed on BOTH sides moves in neither direction: sync
 # converges everything safe and leaves each conflict in place for `resolve`.
 sync_unit() {
-    local dir=$1 rp spec; rp=$(remote_of "$dir"); spec=$(spec_of "$dir")
+    local dir=$1 remote_path spec; remote_path=$(remote_of "$dir"); spec=$(spec_of "$dir")
     load_ignore "$dir"
     bundle_git "$dir" || return 1   # before the probe: the bundle is content to classify
     probe_unit "$dir"
@@ -1183,7 +1159,7 @@ sync_unit() {
              # "manifest is current", since any `status` over agreeing content
              # writes 'sync' regardless of what the manifest holds.
              local shared; shared=$(list_side local "$dir") || return 1
-             sync_point "$rp" "$spec" "$shared" || return 1
+             record_sync_point "$remote_path" "$spec" "$shared" || return 1
              info '%s in sync' "$spec"
              return 0 ;;
     esac
@@ -1191,18 +1167,18 @@ sync_unit() {
     # above stands in for the guard, and the bundle is already fresh.
     case "$DRIFT_BASIS:$DRIFT" in
         absent:*)         send_unit "$dir"; return ;;     # no cloud prefix yet: a first push
-        unbaselined:'<')  load_ignore "$dir" "$rp" || return 1
+        unbaselined:'<')  load_ignore "$dir" "$remote_path" || return 1
                           fetch_unit "$dir"; return ;;    # nothing local to lose: a plain pull
         unbaselined:*)    warn '%s has never been synced from this machine; choose a side' "$spec"
                           warn "with '%s push --force' or '%s pull --force'" "$PROG" "$PROG"
                           return 1 ;;
     esac
 
-    local line cls shape path
+    local line class shape path
     local -a up=() down=() conflicts=()
     while IFS= read -r line; do
         drift_fields "$line"
-        case "$cls:$shape" in
+        case "$class:$shape" in
             local:delete)  down+=("$path") ;;  # deleted here — the union restores it
             local:*)       up+=("$path") ;;    # edited/added here — carry it up
             remote:delete) up+=("$path") ;;    # dropped there — restore it
@@ -1213,15 +1189,15 @@ sync_unit() {
 
     local shared; shared=$(list_side local "$dir") || return 1
     if [ ${#down[@]} -gt 0 ]; then
-        transfer "$rp" "$dir" "$(printf '%s\n' "${down[@]}")" || return 1
+        transfer "$remote_path" "$dir" "$(printf '%s\n' "${down[@]}")" || return 1
         shared+=$'\n'$(printf '%s\n' "${down[@]}")
     fi
     if [ ${#up[@]} -gt 0 ]; then
-        transfer "$dir" "$rp" "$(printf '%s\n' "${up[@]}")" || return 1
+        transfer "$dir" "$remote_path" "$(printf '%s\n' "${up[@]}")" || return 1
     fi
     claim_unit "$dir" || return 1
     restore_git "$dir"
-    sync_point "$rp" "$spec" "$shared" ${conflicts[@]+"${conflicts[@]}"} || return 1
+    record_sync_point "$remote_path" "$spec" "$shared" ${conflicts[@]+"${conflicts[@]}"} || return 1
 
     info '%s: %d up, %d down' "$spec" "${#up[@]}" "${#down[@]}"
     if [ ${#conflicts[@]} -gt 0 ]; then
@@ -1252,8 +1228,9 @@ run_batch() {
         else failed+=("$dir"); warn 'FAILED %s' "$spec"; fi
     done
     if [ ${#failed[@]} -gt 0 ]; then
-        local -a fs=(); for dir in "${failed[@]}"; do fs+=("$(spec_of "$dir")"); done
-        warn '%d/%d ok, %d failed: %s' "$ok" "$n" "${#failed[@]}" "${fs[*]}"
+        local -a failed_specs=()
+        for dir in "${failed[@]}"; do failed_specs+=("$(spec_of "$dir")"); done
+        warn '%d/%d ok, %d failed: %s' "$ok" "$n" "${#failed[@]}" "${failed_specs[*]}"
         return 1
     fi
     info '%d/%d ok' "$ok" "$n"
@@ -1283,18 +1260,18 @@ run_units() {   # <op> <resolver> [<dir>]
 # Resolve a verb's target to the unit it acts on: the argument if given, else the
 # unit enclosing $PWD. Dies if neither yields a unit.
 unit_target() {
-    local t
-    if [ -n "${1:-}" ]; then t=$(resolve_target "$1")
-    else t=$(enclosing_unit "$(pwd -P)") || die "not inside a unit; pass <dir>"; fi
-    is_unit "$t" || die "not a unit: $(spec_of "$t")"
-    printf '%s' "$t"
+    local target
+    if [ -n "${1:-}" ]; then target=$(resolve_target "$1")
+    else target=$(enclosing_unit "$(pwd -P)") || die "not inside a unit; pass <dir>"; fi
+    is_unit "$target" || die "not a unit: $(spec_of "$target")"
+    printf '%s' "$target"
 }
 
 # --- verbs ------------------------------------------------------------------
 cmd_init() {
     local base=$1
-    case "$base" in *:*) ;; *) die "base must look like 'remote:path', got '$base'" ;; esac
-    in_tree && die "already inside a tree rooted at $ROOT"
+    is_remote_base "$base" || die "base must look like 'remote:path', got '$base'"
+    locate_tree && die "already inside a tree rooted at $ROOT"
     [ -e "$PWD/$MARKER" ] && die "$MARKER already exists here"
     printf '%s\n' "$base" > "$PWD/$MARKER"
     info 'initialized root at %s -> %s' "$(pwd -P)" "$base"
@@ -1312,10 +1289,10 @@ cmd_status() {
     local -a units; mapfile -t units < <(units_under "$target")
     [ ${#units[@]} -gt 0 ] || die "no units under $(spec_of "$target")"
 
-    local u
-    for u in "${units[@]}"; do
-        probe_unit "$u"
-        printf '%-3s %s\n' "$DRIFT" "$(spec_of "$u")"
+    local unit
+    for unit in "${units[@]}"; do
+        probe_unit "$unit"
+        printf '%-3s %s\n' "$DRIFT" "$(spec_of "$unit")"
     done
 
     # A single unit leaves its own detail in DRIFT_FILES.
@@ -1324,16 +1301,13 @@ cmd_status() {
     fi
 }
 
-# Stage the cloud side of a conflict so it can be compared with ordinary tools.
-# ferry does not merge — it has no third version to merge against, and a
-# single-user tool with git available per unit does not need one. It makes the
-# other version *available* and leaves the decision to you. The copy lands in the
-# unit's state dir: outside the tree, so it is never transferred, and `drop`/`rm`
-# already take it away with the unit.
+# Stage the cloud side of a conflict in the unit's state dir, to compare with
+# ordinary tools; ferry does not merge. Outside the tree, so it never rides up,
+# and drop/rm take it away with the unit. See ARCHITECTURE.md, "Resolving".
 cmd_resolve() {
     STEPS=1
     local target; target=$(unit_target "${1:-}")
-    local spec rp stage line; spec=$(spec_of "$target"); rp=$(remote_of "$target")
+    local spec remote_path stage line; spec=$(spec_of "$target"); remote_path=$(remote_of "$target")
     stage=$(state_path "$spec")/conflict
     probe_unit "$target"
 
@@ -1349,22 +1323,25 @@ cmd_resolve() {
     if [ "$DRIFT_BASIS" = unbaselined ]; then
         rm -rf "$stage"
         info '%s has never been synced from this machine, so both sides are' "$spec"
-        printf '  unreconciled in full. Compare with '\''rclone ls %s'\'', then push or pull\n' "$rp"
+        printf '  unreconciled in full. Compare with '\''rclone ls %s'\'', then push or pull\n' "$remote_path"
         printf '  with --force to choose a side.\n'
         return 0
     fi
 
     # Everything the cloud touched — the versions you cannot see from here. Files
     # only you changed need no staging: your copy is already the one in hand.
-    local -a wanted=(); local -A label=(); local cls shape path
+    local -a wanted=(); local -A label=(); local class shape path
     while IFS= read -r line; do
         drift_fields "$line"
         # A file the cloud deleted has no version to stage; the rest do.
-        [ "$shape" = delete ] && continue
-        case "$cls" in
-            both)   wanted+=("$path"); label[$path]='changed on both sides' ;;
-            remote) wanted+=("$path"); label[$path]="${shape}ed on the cloud" ;;
+        case "$class:$shape" in
+            *:delete)    continue ;;
+            both:*)      label[$path]='changed on both sides' ;;
+            remote:add)  label[$path]='added on the cloud' ;;
+            remote:edit) label[$path]='edited on the cloud' ;;
+            *)           continue ;;
         esac
+        wanted+=("$path")
     done <<<"$DRIFT_FILES"
     if [ ${#wanted[@]} -eq 0 ]; then
         rm -rf "$stage"
@@ -1381,7 +1358,7 @@ cmd_resolve() {
     # silently skip legitimate filenames.
     rm -rf "$stage.new"; mkdir -p "$stage.new"
     step "staging ${#wanted[@]} cloud file(s)"
-    printf '%s\n' "${wanted[@]}" | run_rclone copy --files-from-raw - "$rp" "$stage.new" \
+    printf '%s\n' "${wanted[@]}" | run_rclone copy --files-from-raw - "$remote_path" "$stage.new" \
         || die "could not stage the cloud version of $spec"
 
     # rclone reports "nothing to transfer" as success, so a path the cloud turns
@@ -1421,9 +1398,9 @@ cmd_new() {
     local target; target=$(resolve_target "$1")
     refuse_in_unit "$target"
     [ -e "$target" ] && die "already exists: $target"
-    local rstate=0; remote_state "$(remote_of "$target")" || rstate=$?
-    [ "$rstate" = 2 ] && die "cannot reach the cloud to check $(remote_of "$target")"
-    [ "$rstate" = 0 ] && die "already on cloud: $(remote_of "$target") (use 'pull' to fetch it)"
+    local presence=0; remote_presence "$(remote_of "$target")" || presence=$?
+    [ "$presence" = 2 ] && die "cannot reach the cloud to check $(remote_of "$target")"
+    [ "$presence" = 0 ] && die "already on cloud: $(remote_of "$target") (use 'pull' to fetch it)"
     mkdir -p "$target"
     claim_unit "$target"
     mark_synced "$(spec_of "$target")" ''
@@ -1462,13 +1439,13 @@ cmd_drop() {
 cmd_rm() {
     local target; target=$(unit_target "$1")
     refuse_cwd_inside "$target"
-    local rp spec rstate=0; rp=$(remote_of "$target"); spec=$(spec_of "$target")
-    remote_state "$rp" || rstate=$?
+    local remote_path spec presence=0; remote_path=$(remote_of "$target"); spec=$(spec_of "$target")
+    remote_presence "$remote_path" || presence=$?
     # Deleting only the local copy while reporting "both sides" would be a lie
     # that also loses the one copy we could still see.
-    [ "$rstate" = 2 ] && die "cannot reach the cloud for $spec — refusing to delete the local copy alone"
+    [ "$presence" = 2 ] && die "cannot reach the cloud for $spec — refusing to delete the local copy alone"
     confirm "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"
-    [ "$rstate" != 0 ] || run_rclone purge "$rp"
+    [ "$presence" != 0 ] || run_rclone purge "$remote_path"
     rm -rf "$target"
     rm -rf "$(state_path "$spec")"
     info 'removed %s from both sides' "$spec"
@@ -1492,22 +1469,22 @@ cmd_mv() {
     refuse_in_unit "$new_abs"
     [ ! -e "$new_abs" ] || die "local target exists: $new_abs"
 
-    local old_rp new_rp old_state=0 new_state=0
-    old_rp=$(remote_of "$old_abs"); new_rp=$(remote_of "$new_abs")
-    remote_state "$new_rp" || new_state=$?
-    [ "$new_state" != 2 ] || die "cannot read the cloud to check $new_spec"
-    [ "$new_state" = 1 ] || die "cloud target exists: $new_rp"
-    remote_state "$old_rp" || old_state=$?
-    [ "$old_state" != 2 ] || die "cannot read the cloud to check $old_spec"
-    [ "$old_state" = 0 ] || [ -e "$old_abs" ] || die "no such unit or directory: $old_spec"
+    local old_remote_path new_remote_path old_presence=0 new_presence=0
+    old_remote_path=$(remote_of "$old_abs"); new_remote_path=$(remote_of "$new_abs")
+    remote_presence "$new_remote_path" || new_presence=$?
+    [ "$new_presence" != 2 ] || die "cannot read the cloud to check $new_spec"
+    [ "$new_presence" = 1 ] || die "cloud target exists: $new_remote_path"
+    remote_presence "$old_remote_path" || old_presence=$?
+    [ "$old_presence" != 2 ] || die "cannot read the cloud to check $old_spec"
+    [ "$old_presence" = 0 ] || [ -e "$old_abs" ] || die "no such unit or directory: $old_spec"
     # 'Absent' may also mean 'behind an unreadable parent'. Once a unit has
     # shared files with the cloud, a local-only move would orphan its copy.
-    if [ "$old_state" = 1 ] && has_shared_files "$old_spec"; then
+    if [ "$old_presence" = 1 ] && has_shared_files "$old_spec"; then
         die "the cloud no longer answers for $old_spec, which it held at the last sync; refusing a local-only move"
     fi
 
-    if [ "$old_state" = 0 ]; then
-        run_rclone moveto "$old_rp" "$new_rp"
+    if [ "$old_presence" = 0 ]; then
+        run_rclone moveto "$old_remote_path" "$new_remote_path"
         info 'moved on cloud %s -> %s' "$old_spec" "$new_spec"
     fi
 
@@ -1517,8 +1494,13 @@ cmd_mv() {
         info 'renamed local %s -> %s' "$old_spec" "$new_spec"
     fi
 
-    local so sn; so=$(state_path "$old_spec"); sn=$(state_path "$new_spec")
-    if [ -d "$so" ]; then rm -rf "$sn"; mkdir -p "$(dirname "$sn")"; mv "$so" "$sn"; fi
+    local old_state_dir new_state_dir
+    old_state_dir=$(state_path "$old_spec"); new_state_dir=$(state_path "$new_spec")
+    if [ -d "$old_state_dir" ]; then
+        rm -rf "$new_state_dir"
+        mkdir -p "$(dirname "$new_state_dir")"
+        mv "$old_state_dir" "$new_state_dir"
+    fi
 }
 
 # Split a VERBS entry into the caller's verb_name / verb_spec / verb_summary.
