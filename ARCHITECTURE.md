@@ -105,7 +105,7 @@ leaf marker sits.
 |---|---|---|
 | `ferry init <base>` | — (writes `.ferry`) | Make `$PWD` a root holding `<base>`. Refused inside an existing tree (no nested roots). |
 | `ferry list [<dir>]` | `rclone lsf --dirs-only --format tp` of `remote_of(dir)` | Remote children of a node (or the root); modtime + name, sorted by name. |
-| `ferry status [<dir>]` | one `rclone check --combined` + one hash listing (`rclone lsf --format thp`) per unit, or neither if the remote prefix is absent (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; for a single unit, also the per-file `local / remote / both` classification (see [Drift classification](#drift-classification)). Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
+| `ferry status [<dir>]` | one `rclone check --combined` + one listing (`rclone lsf --format tp`) per unit, plus `rclone hashsum` of only the differing files, or none of it if the remote prefix is absent (`probe_unit`) | Drift for **every** unit at/under `$PWD`, one `= / > / < / <>` row each; for a single unit, also the per-file `local / remote / both` classification (see [Drift classification](#drift-classification)). Refreshes each unit's prompt cloud bit (see [Sync state](#sync-state--prompt-indicator)). |
 | `ferry pull [<dir>]` | guard, then `rclone copy remote_of→local`, write marker | Materialize a unit (recursive). Deep `pull a/b` auto-creates parent grouping dirs. No arg → walk units under `$PWD`. Refused on a diverged unit (see [Transfer guard](#transfer-guard)). |
 | `ferry push [<dir>]` | guard, bundle git, then `rclone copy local→remote`, write marker | Send a unit up; confers unit status on a fresh dir. No arg → walk units under `$PWD`. Refused on a diverged unit (see [Transfer guard](#transfer-guard)). |
 | `ferry resolve [<dir>]` | `rclone copy --files-from` of the conflicting paths into the unit's state dir | Stage the cloud side of a `<>` so it can be compared with ordinary tools. Never merges, never writes into the unit (see [Transfer guard](#transfer-guard)). |
@@ -212,6 +212,17 @@ down into rclone or out into operational config (enable bucket versioning) — n
 because it detects the backend and adapts. Adding such a branch would be the wrong
 move; the genericity is a property of the model, not of special-casing.
 
+**Hashes can cost a request each.** A backend may leave a file's hash out of a
+directory listing and look it up per file when asked — Filen does, and a file
+uploaded there without rclone has no hash to find at all. Two generic rules keep
+that off the critical path, with no backend branch: every call runs with
+`--fast-list` (one recursive listing, which does carry hashes, where the backend
+has one; rclone otherwise lists per directory whenever a directory exclusion such
+as `.git/**` is in play), and hashes are read with `rclone hashsum` — parallel —
+never with a hash-carrying `lsf`, which asks one file at a time. Drift checks
+read only the flagged files' hashes; a manifest still needs every file's, so a
+unit full of hashless files stays slow to sync, and says so with a running count.
+
 ## Ignore rules
 
 `.ferryignore` keeps files out of a unit — the general form of the `.git`/`.ferry`
@@ -313,10 +324,10 @@ pushed after it arrives with a pre-baseline mtime, yet its hash still differs
 from the ancestor — a cloud change, not silence.
 
 `classify_unit` runs one content check (*which* files differ: `rclone check
---combined`) and one remote listing (`rclone lsf --format thp`: each cloud
-file's mtime and current hash), hashes the flagged local files (`rclone
-hashsum` over only those — never the whole unit), then labels each differing
-file:
+--combined`) and one remote listing (`rclone lsf --format tp`: each cloud
+file's mtime), reads the current hash of the flagged files on each side
+(`rclone hashsum --files-from-raw` over only those — never the whole unit),
+then labels each differing file:
 
 | `rclone check --combined` | changed here | changed there | class |
 |---|---|---|---|
@@ -378,10 +389,11 @@ leaves local ⊆ cloud, so the local file list *is* the intersection; an additiv
 **When** it is read matters as much as which side. The manifest's paths are
 captured *before* the transfer and installed only once it succeeds: taken
 afterwards they would enrol a file written during the transfer, which never
-crossed. The hashes cost nothing extra: a `pull` reads them off the same remote
-listing that supplies the paths, and a `push` reads them *after* the transfer
-from the remote's metadata — every pre-listed path then holds the pushed
-content on both sides, so no local file is ever hashed at sync time. The
+crossed. The hashes come from the remote's metadata (`rclone hashsum`, which
+looks them up in parallel), never from local content: a `pull` reads them
+beside the listing that supplies the paths, and a `push` reads them *after*
+the transfer — every pre-listed path then holds the pushed content on both
+sides, so no local file is ever hashed at sync time. The
 baseline is stamped at completion, because the sync's own writes land after the
 start — the marker, a restored `.git`, and, on a backend that cannot set a
 destination modtime, the transferred objects themselves — and would otherwise

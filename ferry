@@ -123,11 +123,22 @@ tally() {   # <what one line is, e.g. "files listed">
 # --- rclone -----------------------------------------------------------------
 # Every rclone call goes through run_rclone, which traces it under --verbose
 # (main exports RCLONE_VERBOSE for rclone's own logging).
+#
+# --fast-list: one recursive listing instead of one per directory. Beyond
+# fewer requests, it is what carries hashes on Filen: its per-directory listing
+# omits them, so every hash a check, listing or --checksum transfer reads costs
+# a lookup per file (7416 files: 6s with it, many minutes without). Without
+# the flag, rclone lists per directory whenever a directory exclusion is in
+# play — and UNIT_EXCLUDE always holds '.git/**'. Backends without a recursive
+# listing ignore it. A user's RCLONE_FAST_LIST is left to rule, as flags
+# outrank it.
 run_rclone() {
+    local -a list=()
+    [ -n "${RCLONE_FAST_LIST:-}" ] || list=(--fast-list)
     if [ "$VERBOSE" = 1 ]; then
-        printf '%s: + rclone%s\n' "$PROG" "$(printf ' %q' "$@")" >&"$LOG_FD"
+        printf '%s: + rclone%s\n' "$PROG" "$(printf ' %q' ${list[@]+"${list[@]}"} "$@")" >&"$LOG_FD"
     fi
-    rclone "$@"
+    rclone ${list[@]+"${list[@]}"} "$@"
 }
 
 # Short limits for the calls that read the cloud before anything moves.
@@ -417,34 +428,65 @@ state_path() { printf '%s/%s/%s' "$STATE_ROOT" "$STATE_KEY" "$1"; }
 # How the cloud stood at the last look, and when — the bit the prompt renders.
 record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/remote"; }
 
-# Every cloud file of a unit, one "<mtime>;<hash>;<path>" line each — mtimes
-# and hashes hold no ';', so the first two fields always split cleanly off a
-# path that may. The hash field is empty when $1 gives no algorithm (then no
-# ancestor could consume a hash, and computing one may cost a content read).
+# Every cloud file of a unit, one "<mtime>;<path>" line each — an mtime holds
+# no ';', so the first field always splits cleanly off a path that may.
 # Returns non-zero if the listing failed.
 # Times are rendered in UTC: local-time strings go backwards across a DST
 # fall-back, and the baseline cutoff compares them lexicographically.
-remote_listing() {   # <hash type or ''> <remote>
+# No hashes here: a backend may look each one up with its own request (Filen
+# does, for a file uploaded without one — and still finds none), and a listing
+# makes those requests one at a time. Hashes come from hash_paths/remote_hashes.
+remote_listing() {   # <remote>
     step 'listing the cloud'
-    if [ -n "$1" ]; then
-        TZ=UTC rclone_quiet lsf -R --files-only --format thp --separator ';' \
-            --time-format max --hash "$1" "${UNIT_EXCLUDE[@]}" "$2" | tally 'files listed'
-    else
-        TZ=UTC rclone_quiet lsf -R --files-only --format tp --separator ';' \
-            --time-format max "${UNIT_EXCLUDE[@]}" "$2" | tally 'files listed' |
-            sed 's/^[^;]*;/&;/'
-    fi
+    TZ=UTC rclone_quiet lsf -R --files-only --format tp --separator ';' \
+        --time-format max "${UNIT_EXCLUDE[@]}" "$1" | tally 'files listed'
+}
+
+# `rclone hashsum` output ("<hash>  <path>") for the paths on stdin, one per
+# line, under a local dir or a remote — looked up in parallel (--checkers).
+# Returns non-zero if rclone failed.
+hash_paths() {   # <hash type> <local dir or remote>
+    rclone_quiet hashsum "$1" --files-from-raw - "$2" | tally 'files hashed'
+}
+
+# The same for every file of a unit on the cloud, under the unit's exclusions.
+remote_hashes() {   # <hash type> <remote>
+    step 'reading cloud hashes'
+    rclone_quiet hashsum "$1" "${UNIT_EXCLUDE[@]}" "$2" | tally 'files hashed'
+}
+
+# Fill the named map with path → hash from `rclone hashsum` output (stdin). A
+# file the backend holds no hash for is printed with a blank hash and skipped;
+# a hash is bare hex, so its first double space always ends it.
+read_hashes() {   # <map name>
+    local -n into=$1; local line h
+    while IFS= read -r line; do
+        h=${line%%  *}
+        case $h in ''|*[!0-9a-f]*) continue ;; esac
+        into[${line#*  }]=$h
+    done
 }
 
 # One side of a unit, sorted, as manifest raw material. The local side is bare
-# paths; the remote side is "<hash> <path>" ancestor lines hashed with $2 (a
-# hash never holds a space, so the first space always ends it).
+# paths; the remote side is "<hash> <path>" ancestor lines hashed with $3 (a
+# hash never holds a space, so the first space always ends it). The listing
+# decides membership: every listed path gets a line, its hash empty where the
+# backend holds none or $3 names no algorithm.
 # Returns non-zero if the side could not be listed.
-list_side() {
+list_side() {   # <local|remote> <dir or remote> [<hash type>]
     case "$1" in
         local)  find "$2" "${UNIT_PRUNE[@]}" -type f -printf '%P\n' | sort ;;
-        remote) remote_listing "${3:-}" "$2" \
-                    | sed -E 's/^[^;]*;([^;]*);/\1 /' | sort -t' ' -k2 ;;
+        remote) local listing sums line p; local -A hashes=()
+                listing=$(remote_listing "$2") || return 1
+                if [ -n "${3:-}" ]; then
+                    sums=$(remote_hashes "$3" "$2") || return 1
+                    read_hashes hashes <<<"$sums"
+                fi
+                while IFS= read -r line; do
+                    [ -n "$line" ] || continue
+                    p=${line#*;}
+                    printf '%s %s\n' "${hashes[$p]:-}" "$p"
+                done <<<"$listing" | sort -t' ' -k2 ;;
     esac
 }
 
@@ -568,7 +610,7 @@ changed() {  # <local|remote> <path>
 classify_unit() {
     local dir=$1 rp=$2 sd=$3 base=$3/$BASELINE
     local -A M_SYNCED=() M_ANCESTOR=() lmoved=() lhash=() rmoved=() rhash=()
-    local M_TYPE='' line flag cls shape p h i lch rch
+    local M_TYPE='' line flag cls shape p i lch rch
     read_manifest "$sd/$MANIFEST"
 
     while IFS= read -r p; do lmoved[$p]=1; done < <(
@@ -615,39 +657,45 @@ classify_unit() {
     [ ${#paths[@]} -gt 0 ] || return 0    # nothing differs: no listing to consult
     step "${#paths[@]} file(s) differ"
 
-    # One remote listing carries every cloud file's current hash (primary) and
-    # mtime (fallback); only the flagged files are ever consulted, so only they
-    # are kept. Times compare as strings: 'max' keeps the fixed
-    # "Y-m-d H:M:S.ns" layout, where lexicographic and chronological order
-    # agree, and the baseline cutoff keeps the same precision.
-    local cutoff listing rest
+    # The remote listing carries every cloud file's mtime (the fallback); only
+    # the flagged files are ever consulted, so only they are kept. Times compare
+    # as strings: 'max' keeps the fixed "Y-m-d H:M:S.ns" layout, where
+    # lexicographic and chronological order agree, and the baseline cutoff
+    # keeps the same precision.
+    local cutoff listing
     cutoff=$(TZ=UTC date '+%Y-%m-%d %H:%M:%S.%N' -r "$base")
-    listing=$(remote_listing "$M_TYPE" "$rp") || return 1
+    listing=$(remote_listing "$rp") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        rest=${line#*;}; p=${rest#*;}
+        p=${line#*;}
         [ -n "${flagged[$p]:-}" ] || continue
-        rhash[$p]=${rest%%;*}
         [[ ${line%%;*} > $cutoff ]] && rmoved[$p]=1
     done <<<"$listing"
 
-    # Current local hashes — only for flagged files with an ancestor hash to
-    # compare against; hashing is O(content), so never the whole unit. An
-    # ancestor hash implies a v2 manifest, so M_TYPE is set here.
-    local -a lneed=()
+    # Current hashes (the primary evidence) — only for flagged files with an
+    # ancestor hash to compare against, and only on the side changed() asks
+    # about for that flag: hashing is O(content) locally and may cost a request
+    # per file on the cloud, so never the whole unit. An ancestor hash implies a
+    # v2 manifest, so M_TYPE is set here. A cloud lookup that fails is trouble
+    # like a failed listing; a local one leaves that side on the mtime fallback.
+    local -a lneed=() rneed=()
     for i in "${!paths[@]}"; do
+        [ -n "${M_ANCESTOR[${paths[$i]}]:-}" ] || continue
         case ${flags[$i]} in
-            '*'|'+') [ -n "${M_ANCESTOR[${paths[$i]}]:-}" ] && lneed+=("${paths[$i]}") ;;
+            '*') lneed+=("${paths[$i]}"); rneed+=("${paths[$i]}") ;;
+            '+') lneed+=("${paths[$i]}") ;;
+            '-') rneed+=("${paths[$i]}") ;;
         esac
     done
+    if [ ${#rneed[@]} -gt 0 ]; then
+        step "reading ${#rneed[@]} cloud hash(es)"
+        local sums
+        sums=$(printf '%s\n' "${rneed[@]}" | hash_paths "$M_TYPE" "$rp") || return 1
+        read_hashes rhash <<<"$sums"
+    fi
     if [ ${#lneed[@]} -gt 0 ]; then
         step "hashing ${#lneed[@]} local file(s)"
-        while IFS= read -r line; do
-            h=${line%%  *}
-            case $h in ''|*[!0-9a-f]*) continue ;; esac
-            lhash[${line#*  }]=$h
-        done < <(printf '%s\n' "${lneed[@]}" |
-            rclone_quiet hashsum "$M_TYPE" --files-from-raw - "$dir" | tally 'files hashed')
+        read_hashes lhash < <(printf '%s\n' "${lneed[@]}" | hash_paths "$M_TYPE" "$dir")
     fi
 
     for i in "${!paths[@]}"; do
