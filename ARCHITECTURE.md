@@ -688,8 +688,8 @@ history into a single file *before* pushing files, so the bundle rides up with
 the rest:
 
 ```
-git bundle create .history.bundle.tmp --all
-mv .history.bundle.tmp history.bundle    # atomic rename; never push a partial file
+rm -f history.bundle.lock                 # a lock an interrupted run left behind
+git bundle create history.bundle --all    # atomic: git writes through the lock
 rclone copy <unit dir> remote_of(<unit dir>) --exclude '.git/**' --exclude '.ferry'
 ```
 

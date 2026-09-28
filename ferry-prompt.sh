@@ -153,7 +153,7 @@ __ferry_ps1() {
     base=$(head -1 "$root/$FERRY_MARKER")
     __ferry_ps1_state_key "$base"
     local sd=$FERRY_STATE_ROOT/$key${spec:+/$spec}
-    local marker=$sd/synced_at
+    local marker=$sd/synced_at remote_bit=$sd/remote   # `ferry`'s BASELINE and REMOTE_BIT
 
     # No baseline yet (never pushed/pulled from here) → unknown.
     if [ ! -e "$marker" ]; then
@@ -168,8 +168,8 @@ __ferry_ps1() {
     # 'diverged' also forces the local half: `ferry status` compares content and
     # can see a conflict — two sides edited to different bytes with mtimes older
     # than the baseline — that this function's mtime walk never would.
-    if [ -r "$sd/remote" ]; then
-        read -r rstate rtime < "$sd/remote"
+    if [ -r "$remote_bit" ]; then
+        read -r rstate rtime < "$remote_bit"
         case $rstate in
             behind)   behind='<' ;;
             diverged) behind='<'; ahead='>' ;;

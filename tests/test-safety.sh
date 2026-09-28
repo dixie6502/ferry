@@ -140,7 +140,7 @@ printf 'y\n' > "$WORK/g/doc.txt"
 ferry push g >/dev/null 2>&1; rc=$?
 check 'a bundle that cannot be built fails the push' '1' "$rc"
 check '  nothing went up' 'x' "$(cat "$CLOUD/g/doc.txt")"
-check '  no temporary bundle is left behind' 'no' "$(yes_no test -e "$WORK/g/.history.bundle.tmp")"
+check '  no bundle lock is left behind' 'no' "$(yes_no test -e "$WORK/g/history.bundle.lock")"
 
 reset_tree
 mkdir -p "$CLOUD/h"; printf 'x\n' > "$CLOUD/h/doc.txt"; printf 'not a bundle\n' > "$CLOUD/h/history.bundle"
@@ -164,5 +164,9 @@ ferry push r >/dev/null 2>&1
 rm -rf "$WORK/r"
 ferry pull r >/dev/null 2>&1
 check 'a sound bundle restores its history' 'init' "$(git -C "$WORK/r" log -1 --format=%s 2>&1)"
+: > "$WORK/r/history.bundle.lock"                # what a killed `git bundle` leaves
+ferry push r >/dev/null 2>&1; rc=$?
+check 'a stale bundle lock neither blocks the push nor rides up' '0 no no' \
+    "$rc $(yes_no test -e "$CLOUD/r/history.bundle.lock") $(yes_no test -e "$WORK/r/history.bundle.lock")"
 
 report

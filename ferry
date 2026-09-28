@@ -43,6 +43,7 @@ readonly IGNORE_FILE='.ferryignore'
 readonly STATE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/ferry"
 readonly BASELINE='synced_at'
 readonly MANIFEST='manifest'
+readonly REMOTE_BIT='remote'
 
 # Always keep git internals and the markers themselves out of transfers. The
 # marker exclusion also protects a local `.ferry` from deletion under --mirror.
@@ -56,14 +57,33 @@ readonly FIND_PRUNE=(-name .git -prune -o -name "$MARKER" -prune -o)
 # remote listing, local walk — goes through these, never the base arrays: an
 # exclusion that reached one and not the others would leave a file drifted
 # forever (a stuck '>' in the prompt, a permanent 'remote add' in status).
+# A reader given the unit's directory loads them itself (a memo hit when
+# already loaded); pull, push and sync also load them at entry for the readers
+# given only a remote. Until a load they hold the base exclusions, so a missed
+# load never exposes .git.
 UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
 UNIT_PRUNE=("${FIND_PRUNE[@]}")
 IGNORE_LOADED=''
 
-# Set by probe_unit: a unit's drift symbol, and the per-file classification
-# behind it (empty unless a full comparison ran).
+# Set by probe_unit: a unit's drift symbol, the per-file classification behind
+# it, and what the symbol rests on:
+#   compared     a full comparison against the last sync ran (DRIFT_FILES set)
+#   absent       nothing on the cloud: local content alone decides
+#   unbaselined  both sides may hold content, never synced from this machine
+#   unreadable   the cloud could not be read (DRIFT is '?')
 DRIFT=''
 DRIFT_FILES=''
+DRIFT_BASIS=''
+
+# The enclosing tree, set by in_tree: its directory, its remote base, and the
+# base's key under STATE_ROOT.
+ROOT=''
+BASE=''
+STATE_KEY=''
+
+# See remote_hash_type.
+HASH_PROBED=0
+HASH_TYPE=''
 
 # Every verb, as "<name> <arguments> — <summary>": the one source for argument
 # and flag checks, help and completion. In <arguments>, `<x>` is required,
@@ -105,14 +125,17 @@ STEPS=0
 LOG_FD=2
 
 # --- helpers ----------------------------------------------------------------
-die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+# Messages, prefixed with the program name: printf-style, a newline added.
+info() { local format=$1; shift; printf "%s: $format\n" "$PROG" "$@"; }
+warn() { info "$@" >&2; }
+die()  { warn '%s' "$*"; exit 1; }
 
 require() { command -v "$1" >/dev/null || die "$1 not found"; }
 
 # Announce a phase of the current unit's run (see STEPS).
 step() {
     [ "$STEPS" = 1 ] || return 0
-    printf '%s:   %s\n' "$PROG" "$*" >&"$LOG_FD"
+    info '  %s' "$*" >&"$LOG_FD"
 }
 
 # Pass stdin through unchanged while counting its lines under the current step
@@ -181,10 +204,15 @@ show_rclone_log() {   # <is failure: 0|1> <log>
 
 # run_probe with stderr held back for show_rclone_log: a probe that succeeds
 # stays quiet, one that fails says why. Stdout passes through.
-rclone_quiet() {
-    local err status=0
+rclone_quiet() { rclone_expect 0 "$@"; }
+
+# The same, for a call whose listed exit statuses are all answers the caller
+# handles (rclone's 3: "not found"): its log is shown only for any other status.
+rclone_expect() {   # <expected statuses, comma-separated> <rclone args>...
+    local expected=",$1," err status=0 failed=1; shift
     { err=$(run_probe "$@" 2>&1 >&3 3>&-); } 3>&1 || status=$?
-    show_rclone_log "$((status != 0))" "$err"
+    [[ $expected != *",$status,"* ]] || failed=0
+    show_rclone_log "$failed" "$err"
     return "$status"
 }
 
@@ -271,7 +299,7 @@ is_unit() { [ -f "$1/$MARKER" ] && [ ! -s "$1/$MARKER" ] && ! has_sub_marker "$1
 # marker is empty; the root marker has content, so the root never matches.
 enclosing_unit() {
     local d=$1
-    while [ "$d" != / ] && [ "$d" != "${ROOT:-}" ]; do
+    while [ "$d" != / ] && [ "$d" != "$ROOT" ]; do
         if [ -f "$d/$MARKER" ] && [ ! -s "$d/$MARKER" ]; then printf '%s' "$d"; return 0; fi
         d=$(dirname "$d")
     done
@@ -431,23 +459,19 @@ compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
 # A load with a remote always runs: an earlier local-only load of the same unit
 # (sync, before it hands a first pull over) left the cloud's rules out.
 load_ignore() {   # <unit dir> [<remote>]
-    local dir=$1 rp=${2:-} f rules errf status=0
+    local dir=$1 rp=${2:-} f rules status=0
     [ -n "$rp" ] || [ "$IGNORE_LOADED" != "$dir" ] || return 0
     UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
     UNIT_PRUNE=("${FIND_PRUNE[@]}")
-    if [ -n "${ROOT:-}" ] && [ -f "$ROOT/$IGNORE_FILE" ]; then
+    if [ -n "$ROOT" ] && [ -f "$ROOT/$IGNORE_FILE" ]; then
         compile_ignore "$ROOT/$IGNORE_FILE" "$dir" < "$ROOT/$IGNORE_FILE"
     fi
     f=$dir/$IGNORE_FILE
     if [ -f "$f" ]; then
         compile_ignore "$f" "$dir" < "$f"
     elif [ -n "$rp" ]; then
-        # rclone answers 3 for a missing file and for a missing prefix alike;
-        # its log is shown only for real trouble, as in remote_state.
-        errf=$(mktemp)
-        rules=$(run_probe cat "$rp/$IGNORE_FILE" 2>"$errf") || status=$?
-        show_rclone_log "$((status != 0 && status != 3))" "$(<"$errf")"
-        rm -f "$errf"
+        # rclone answers 3 for a missing file and for a missing prefix alike.
+        rules=$(rclone_expect 0,3 cat "$rp/$IGNORE_FILE") || status=$?
         case $status in
             0) compile_ignore "$rp/$IGNORE_FILE" "$dir" <<<"$rules" ;;
             3) ;;
@@ -464,9 +488,8 @@ load_ignore() {   # <unit dir> [<remote>]
 # for a path that is not there and for one behind an unreadable parent, so those
 # two stay conflated; every other failure is reported as trouble.
 remote_state() {
-    local err status=0
-    err=$(run_probe lsjson "$1" 2>&1 >/dev/null) || status=$?
-    case $status in 0|3) show_rclone_log 0 "$err" ;; *) show_rclone_log 1 "$err" ;; esac
+    local status=0
+    rclone_expect 0,3 lsjson "$1" >/dev/null || status=$?
     case $status in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
@@ -476,7 +499,6 @@ remote_state() {
 # Probed once — the base is fixed for a run. A failed probe fails rather than
 # recording "no hashes": that would silently downgrade a hash-capable backend
 # to the mtime fallback for a whole sync cycle.
-HASH_PROBED=0 HASH_TYPE=''
 remote_hash_type() {
     [ "$HASH_PROBED" = 1 ] && return 0
     local out flat h=''
@@ -524,7 +546,7 @@ adopt_legacy_state() {
 }
 
 # How the cloud stood at the last look, and when — the bit the prompt renders.
-record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/remote"; }
+record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/$REMOTE_BIT"; }
 
 # Every cloud file of a unit, one "<mtime>;<path>" line each — an mtime holds
 # no ';', so the first field always splits cleanly off a path that may.
@@ -573,7 +595,8 @@ read_hashes() {   # <map name>
 # Returns non-zero if the side could not be listed.
 list_side() {   # <local|remote> <dir or remote> [<hash type>]
     case "$1" in
-        local)  find "$2" "${UNIT_PRUNE[@]}" -type f -printf '%P\n' | sort ;;
+        local)  load_ignore "$2"
+                find "$2" "${UNIT_PRUNE[@]}" -type f -printf '%P\n' | sort ;;
         remote) local listing sums line p; local -A hashes=()
                 listing=$(remote_listing "$2") || return 1
                 if [ -n "${3:-}" ]; then
@@ -592,24 +615,26 @@ list_side() {   # <local|remote> <dir or remote> [<hash type>]
 # 'none' spells the empty hash type only here and in read_manifest.
 manifest_v2() { printf '#ferry v2 %s\n%s' "${1:-none}" "$2"; }
 
-# Read a manifest into the caller's M_TYPE / M_SYNCED / M_ANCESTOR (declare
-# them local first). v2 gives membership and ancestor hashes; a v1 manifest
-# (bare paths, pre-hash) gives membership only, every ancestor unknown.
-read_manifest() {
+# Read a manifest into the named variables: its hash type, and path → 1 /
+# path → ancestor hash maps. v2 gives membership and ancestor hashes; a v1
+# manifest (bare paths, pre-hash) gives membership only, every ancestor unknown.
+read_manifest() {   # <file> <hash type var> <membership map> <ancestor map>
+    local -n type_out=$2 synced_out=$3 ancestor_out=$4
     local line first=1 v2=0
-    M_TYPE=''
+    type_out=''
     while IFS= read -r line; do
         if [ "$first" = 1 ]; then
             first=0
             case $line in
-                '#ferry v2 '*) v2=1; M_TYPE=${line##* }
-                               [ "$M_TYPE" = none ] && M_TYPE=''
+                '#ferry v2 '*) v2=1; type_out=${line##* }
+                               [ "$type_out" != none ] || type_out=''
                                continue ;;
             esac
         fi
         [ -n "$line" ] || continue
-        if [ "$v2" = 1 ]; then M_SYNCED[${line#* }]=1; M_ANCESTOR[${line#* }]=${line%% *}
-        else M_SYNCED[$line]=1; fi
+        # shellcheck disable=SC2004  # associative maps behind namerefs
+        if [ "$v2" = 1 ]; then synced_out[${line#* }]=1; ancestor_out[${line#* }]=${line%% *}
+        else synced_out[$line]=1; fi
     done < "$1"
 }
 
@@ -657,22 +682,16 @@ has_shared_files() {   # <spec>
 # True if a unit holds any transferable file (markers and git internals aside).
 has_local_content() {
     [ -d "$1" ] || return 1
+    load_ignore "$1"
     [ -n "$(find "$1" "${UNIT_PRUNE[@]}" -type f -print -quit)" ]
 }
 
 # Did one side change a file since the last sync? Judged against the recorded
 # ancestor hash when both hashes are in hand, else by whether that side's
-# mtime moved past the baseline (v1 manifests, hashless entries). Reads
-# classify_unit's maps through bash's dynamic scoping, so which map belongs to
-# which side is decided here, not at every call site.
-changed() {  # <local|remote> <path>
-    local h m a=${M_ANCESTOR[$2]:-}
-    case $1 in
-        local)  h=${lhash[$2]:-} m=${lmoved[$2]:-} ;;
-        remote) h=${rhash[$2]:-} m=${rmoved[$2]:-} ;;
-    esac
-    if [ -n "$h" ] && [ -n "$a" ]; then [ "$h" != "$a" ]
-    else [ -n "$m" ]; fi
+# mtime moved past the baseline (v1 manifests, hashless entries).
+side_changed() {   # <current hash> <ancestor hash> <moved past baseline: 1 or ''>
+    if [ -n "$1" ] && [ -n "$2" ]; then [ "$1" != "$2" ]
+    else [ -n "$3" ]; fi
 }
 
 # Per-file drift for a unit, one "<class> <shape> <path>" line per differing file:
@@ -713,12 +732,10 @@ changed() {  # <local|remote> <path>
 # as "no differences" (see probe_unit).
 classify_unit() {
     local dir=$1 rp=$2 sd=$3 base=$3/$BASELINE
-    local -A M_SYNCED=() M_ANCESTOR=() lmoved=() lhash=() rmoved=() rhash=()
-    local M_TYPE='' line flag cls shape p i lch rch
-    read_manifest "$sd/$MANIFEST"
-
-    while IFS= read -r p; do lmoved[$p]=1; done < <(
-        find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$base" -printf '%P\n')
+    local -A synced=() ancestor=() lmoved=() lhash=() rmoved=() rhash=()
+    local manifest_type line flag cls shape p a i lch rch
+    load_ignore "$dir"
+    read_manifest "$sd/$MANIFEST" manifest_type synced ancestor
 
     # rclone exits 1 both for "differences found" (the normal case here) and for
     # trouble, and downgrades a directory it could not list to a stderr tally
@@ -761,6 +778,9 @@ classify_unit() {
     [ ${#paths[@]} -gt 0 ] || return 0    # nothing differs: no listing to consult
     step "${#paths[@]} file(s) differ"
 
+    while IFS= read -r p; do lmoved[$p]=1; done < <(
+        find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$base" -printf '%P\n')
+
     # The remote listing carries every cloud file's mtime (the fallback); only
     # the flagged files are ever consulted, so only they are kept. Times compare
     # as strings: 'max' keeps the fixed "Y-m-d H:M:S.ns" layout, where
@@ -777,14 +797,15 @@ classify_unit() {
     done <<<"$listing"
 
     # Current hashes (the primary evidence) — only for flagged files with an
-    # ancestor hash to compare against, and only on the side changed() asks
-    # about for that flag: hashing is O(content) locally and may cost a request
-    # per file on the cloud, so never the whole unit. An ancestor hash implies a
-    # v2 manifest, so M_TYPE is set here. A cloud lookup that fails is trouble
-    # like a failed listing; a local one leaves that side on the mtime fallback.
+    # ancestor hash to compare against, and only on the side whose change
+    # decides that flag: hashing is O(content) locally and may cost a request
+    # per file on the cloud, so never the whole unit. An ancestor hash implies
+    # a v2 manifest, so manifest_type is set here. A cloud lookup that fails is
+    # trouble like a failed listing; a local one leaves that side on the mtime
+    # fallback.
     local -a lneed=() rneed=()
     for i in "${!paths[@]}"; do
-        [ -n "${M_ANCESTOR[${paths[$i]}]:-}" ] || continue
+        [ -n "${ancestor[${paths[$i]}]:-}" ] || continue
         case ${flags[$i]} in
             '*') lneed+=("${paths[$i]}"); rneed+=("${paths[$i]}") ;;
             '+') lneed+=("${paths[$i]}") ;;
@@ -794,29 +815,29 @@ classify_unit() {
     if [ ${#rneed[@]} -gt 0 ]; then
         step "reading ${#rneed[@]} cloud hash(es)"
         local sums
-        sums=$(printf '%s\n' "${rneed[@]}" | hash_paths "$M_TYPE" "$rp") || return 1
+        sums=$(printf '%s\n' "${rneed[@]}" | hash_paths "$manifest_type" "$rp") || return 1
         read_hashes rhash <<<"$sums"
     fi
     if [ ${#lneed[@]} -gt 0 ]; then
         step "hashing ${#lneed[@]} local file(s)"
-        read_hashes lhash < <(printf '%s\n' "${lneed[@]}" | hash_paths "$M_TYPE" "$dir")
+        read_hashes lhash < <(printf '%s\n' "${lneed[@]}" | hash_paths "$manifest_type" "$dir")
     fi
 
     for i in "${!paths[@]}"; do
-        flag=${flags[$i]} p=${paths[$i]} shape=edit
+        flag=${flags[$i]} p=${paths[$i]} shape=edit a=${ancestor[$p]:-}
+        lch=0; side_changed "${lhash[$p]:-}" "$a" "${lmoved[$p]:-}" && lch=1
+        rch=0; side_changed "${rhash[$p]:-}" "$a" "${rmoved[$p]:-}" && rch=1
         case "$flag" in
-            '*') lch=0; changed local "$p" && lch=1
-                 rch=0; changed remote "$p" && rch=1
-                 case "$lch$rch" in
+            '*') case "$lch$rch" in
                      10) cls=local ;; 01) cls=remote ;; *) cls=both ;;    # 00: unattributable
                  esac ;;
             '+') shape=delete
-                 if [ -z "${M_SYNCED[$p]:-}" ]; then cls=local shape=add  # not shared last sync
-                 elif changed local "$p"; then cls=both                   # edited here, dropped there
+                 if [ -z "${synced[$p]:-}" ]; then cls=local shape=add    # not shared last sync
+                 elif [ "$lch" = 1 ]; then cls=both                       # edited here, dropped there
                  else cls=remote; fi ;;                                   # the cloud dropped it
             '-') shape=delete
-                 if [ -z "${M_SYNCED[$p]:-}" ]; then cls=remote shape=add # never here: it arrived there
-                 elif changed remote "$p"; then cls=both                  # deleted here, changed there
+                 if [ -z "${synced[$p]:-}" ]; then cls=remote shape=add   # never here: it arrived there
+                 elif [ "$rch" = 1 ]; then cls=both                       # deleted here, changed there
                  else cls=local; fi ;;                                    # deleted here
             '!') cls=both ;;
         esac
@@ -867,31 +888,33 @@ print_drift_files() {
 # DRIFT is '?' when the cloud could not be read — never a confident symbol.
 probe_unit() {
     local dir=$1 rp sd base bits reachable=0
-    load_ignore "$dir"
     rp=$(remote_of "$dir"); sd=$(state_path "$(spec_of "$dir")"); base=$sd/$BASELINE
     DRIFT_FILES=''
 
     step 'comparing with the cloud'
     remote_state "$rp" || reachable=$?
     if [ "$reachable" = 2 ]; then
-        DRIFT='?'; return 0          # could not look; see the '?' note below
+        DRIFT='?' DRIFT_BASIS=unreadable; return 0    # see the '?' note below
     elif [ "$reachable" = 1 ]; then
         # Nothing on the cloud (never pushed, or an empty unit on an object store
         # that cannot hold empty dirs): local content is unpushed, empty is in sync.
+        DRIFT_BASIS=absent
         if has_local_content "$dir"; then bits=10; else bits=00; fi
     elif [ -d "$dir" ] && [ -e "$base" ] && [ -e "$sd/$MANIFEST" ]; then
         if DRIFT_FILES=$(classify_unit "$dir" "$rp" "$sd"); then
+            DRIFT_BASIS=compared
             bits=$(drift_bits <<<"$DRIFT_FILES")
         else
             # The cloud could not be read. Claiming '=' here would be a lie the
             # prompt then repeats, so report '?' and leave the stored bit — and
             # its age, which drives the prompt's staleness marker — untouched.
-            DRIFT_FILES=''; DRIFT='?'; return 0
+            DRIFT_FILES='' DRIFT='?' DRIFT_BASIS=unreadable; return 0
         fi
-    elif has_local_content "$dir"; then
-        bits=11   # no baseline: both sides hold content, direction unknowable
     else
-        bits=01   # no baseline, nothing local to lose — a pull is a pure fetch
+        # No baseline: with local content, direction is unknowable; without,
+        # there is nothing local to lose — a pull is a pure fetch.
+        DRIFT_BASIS=unbaselined
+        if has_local_content "$dir"; then bits=11; else bits=01; fi
     fi
     DRIFT=$(drift_symbol "$bits")
 
@@ -909,12 +932,6 @@ probe_unit() {
 # Move bytes src -> dst, excluding git internals and markers. mirror=1 propagates
 # deletions (rclone sync); otherwise additive (rclone copy).
 #
-# When hashes drive attribution they must drive the skip rule too: rclone's
-# default skips a file whose size and modtime match even when content differs,
-# so a same-size preserved-mtime edit would stay untransferred while its hash
-# is recorded as the shared ancestor — and a later guard-approved transfer
-# would overwrite the unseen edit. --checksum makes "skipped" mean "identical",
-# which is what mark_synced records.
 # Filter and skip rule differ by shape. Whole tree: the usual exclusions, and
 # --checksum whenever hashes drive attribution — rclone's default skip
 # (size+modtime) would leave a same-size preserved-mtime edit untransferred
@@ -938,7 +955,6 @@ transfer() {
     case $src in "$BASE"*) way=downloading ;; esac
     [ -z "$files" ] || count=" $(grep -c '' <<<"$files") file(s)"
     step "$way$count"
-    remote_hash_type || return 1
     local -a progress=(--progress)
     [ -t 2 ] || progress=(--stats 10s --stats-one-line --stats-log-level NOTICE)
     if [ -n "$files" ]; then
@@ -948,7 +964,8 @@ transfer() {
             --ignore-times "${progress[@]}" "$src" "$dst"
     else
         local -a flags=()
-        [ -n "$HASH_TYPE" ] && flags+=(--checksum)
+        remote_hash_type || return 1
+        [ -z "$HASH_TYPE" ] || flags+=(--checksum)
         run_rclone "$verb" ${flags[@]+"${flags[@]}"} "${UNIT_EXCLUDE[@]}" \
             "${progress[@]}" "$src" "$dst"
     fi
@@ -964,10 +981,10 @@ restore_git() {
     [ -f "$bundle" ] || return 0
     [ ! -e "$dir/.git" ] || return 0   # a directory, or a worktree/submodule link
 
-    printf '%s: restoring git history from history.bundle\n' "$PROG"
+    info 'restoring git history from history.bundle'
     if ! attach_bundle "$dir" "$bundle"; then
         rm -rf "$dir/.git"
-        printf '%s: could not restore git history from %s; the next pull retries\n' "$PROG" "$bundle" >&2
+        warn 'could not restore git history from %s; the next pull retries' "$bundle"
     fi
 }
 
@@ -982,31 +999,35 @@ attach_bundle() {   # <dir> <bundle>
     branches=$(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads/) || return 1
     branch=$(grep -Ex 'main|master' <<<"$branches" | head -1 || true)
     [ -n "$branch" ] || branch=$(head -1 <<<"$branches")
-    [ -n "$branch" ] || { printf '%s: bundle has no branches\n' "$PROG" >&2; return 1; }
+    [ -n "$branch" ] || { warn 'bundle has no branches'; return 1; }
     git -C "$dir" symbolic-ref HEAD "refs/heads/$branch" || return 1
     git -C "$dir" reset -q
 }
 
 # Snapshot git history into a single file the next push carries up. A failed
 # bundle fails the caller: pushing on would carry a stale history as current.
+#
+# git writes the bundle atomically itself (through history.bundle.lock). A
+# lock an interrupted run left behind is removed first — before any early
+# return, since every upload bundles before it transfers — or it would block
+# each later bundle and ride up as content.
 bundle_git() {
     local dir=$1 refs
+    rm -f "$dir/history.bundle.lock"
     [ -d "$dir/.git" ] || return 0
     # No commits yet: nothing to carry, and git refuses an empty bundle.
     refs=$(git -C "$dir" for-each-ref --count=1) || return 1
     [ -n "$refs" ] || return 0
 
-    printf '%s: bundling git history\n' "$PROG"
-    if ! git -C "$dir" bundle create "$dir/.history.bundle.tmp" --all; then
-        rm -f "$dir/.history.bundle.tmp"
-        printf '%s: could not bundle the git history of %s\n' "$PROG" "$dir" >&2
+    info 'bundling git history'
+    if ! git -C "$dir" bundle create "$dir/history.bundle" --all; then
+        warn 'could not bundle the git history of %s' "$dir"
         return 1
     fi
-    mv "$dir/.history.bundle.tmp" "$dir/history.bundle" || return 1
 
     if [ -f "$dir/.gitignore" ] && ! grep -qxF 'history.bundle' "$dir/.gitignore"; then
         printf 'history.bundle\n' >> "$dir/.gitignore"
-        printf '%s: added history.bundle to .gitignore\n' "$PROG"
+        info 'added history.bundle to .gitignore'
     fi
 }
 
@@ -1029,10 +1050,9 @@ guard_transfer() {
     [ "$FORCE" = 1 ] && return 0
     probe_unit "$dir"
 
-    case "$DRIFT" in
-        '?')  reason='unknown: the cloud could not be read' ;;
-        '<>') [ -n "$DRIFT_FILES" ] ||
-                  reason='diverged: never synced from this machine, so neither side is known to be newer' ;;
+    case "$DRIFT_BASIS:$DRIFT" in
+        unreadable:*)     reason='unknown: the cloud could not be read' ;;
+        unbaselined:'<>') reason='diverged: never synced from this machine, so neither side is known to be newer' ;;
     esac
 
     # The far side is the one this transfer writes over.
@@ -1056,12 +1076,12 @@ guard_transfer() {
     fi
     [ -n "$reason" ] || return 0
 
-    printf '%s: refusing to %s %s — %s\n' "$PROG" "$verb" "$(spec_of "$dir")" "$reason" >&2
+    warn 'refusing to %s %s — %s' "$verb" "$(spec_of "$dir")" "$reason"
     [ ${#blocking[@]} -eq 0 ] || printf '    %s\n' "${blocking[@]}" >&2
-    if [ "$DRIFT" = '?' ]; then
-        printf '%s: retry when the cloud is reachable, or override with --force\n' "$PROG" >&2
+    if [ "$DRIFT_BASIS" = unreadable ]; then
+        warn 'retry when the cloud is reachable, or override with --force'
     else
-        printf "%s: inspect it with '%s resolve', or override with --force\n" "$PROG" "$PROG" >&2
+        warn "inspect it with '%s resolve', or override with --force" "$PROG"
     fi
     return 1
 }
@@ -1069,9 +1089,16 @@ guard_transfer() {
 # --- per-unit operations ----------------------------------------------------
 # Each returns non-zero (rather than dying) so a walk can tally and carry on.
 pull_unit() {
-    local dir=$1 rp manifest; rp=$(remote_of "$dir")
-    load_ignore "$dir" "$rp" || return 1
+    local dir=$1
+    load_ignore "$dir" "$(remote_of "$dir")" || return 1
     guard_transfer pull "$dir" || return 1
+    fetch_unit "$dir"
+}
+
+# The transfer half of a pull, once the guard has passed and the cloud's rules
+# are loaded.
+fetch_unit() {
+    local dir=$1 rp manifest; rp=$(remote_of "$dir")
     # An additive pull leaves cloud ⊆ local, so the cloud's list — hashes
     # included — is the set the two sides will share. A listing that fails must
     # fail the transfer, not quietly record an empty ancestor set.
@@ -1085,11 +1112,17 @@ pull_unit() {
 }
 
 push_unit() {
-    local dir=$1 rp paths; rp=$(remote_of "$dir")
+    local dir=$1
     load_ignore "$dir"
-    [ -d "$dir" ] || { printf '%s: no local dir %s\n' "$PROG" "$dir" >&2; return 1; }
+    [ -d "$dir" ] || { warn 'no local dir %s' "$dir"; return 1; }
     guard_transfer push "$dir" || return 1
     bundle_git "$dir" || return 1          # before the snapshot: the bundle is content
+    send_unit "$dir"
+}
+
+# The transfer half of a push, once the guard has passed and the bundle is fresh.
+send_unit() {
+    local dir=$1 rp paths; rp=$(remote_of "$dir")
     # An additive push leaves local ⊆ cloud, so the local list is the shared
     # set: its paths captured BEFORE the transfer, their hashes read AFTER —
     # exactly sync_point's recipe.
@@ -1107,23 +1140,23 @@ push_unit() {
 # previous ancestor line instead of the cloud's current hash: both sides still
 # differ from it, so they keep reading 'both' and `resolve` keeps working
 # across syncs — and the prompt bit records 'diverged', never a clean 'sync'.
-sync_point() {   # <rp> <spec> <local paths> [<conflicted path>...]
-    local rp=$1 spec=$2 keep=$3; shift 3
+sync_point() {   # <remote> <spec> <shared paths> [<conflicted path>...]
+    local rp=$1 spec=$2 shared=$3; shift 3
     remote_hash_type || return 1
     local body='' line p
-    if [ -n "$keep" ]; then
+    if [ -n "$shared" ]; then
         body=$(list_side remote "$rp" "$HASH_TYPE") || return 1
-        body=$(intersect_manifest "$keep" "$body")
+        body=$(intersect_manifest "$shared" "$body")
     fi
     if [ $# -gt 0 ]; then
-        local -A M_SYNCED=() M_ANCESTOR=() confl=(); local M_TYPE='' out=''
-        read_manifest "$(state_path "$spec")/$MANIFEST"
+        local -A synced=() ancestor=() confl=(); local manifest_type out=''
+        read_manifest "$(state_path "$spec")/$MANIFEST" manifest_type synced ancestor
         for p in "$@"; do confl[$p]=1; done
         while IFS= read -r line; do
             [ -n "$line" ] || continue
             [ -n "${confl[${line#* }]:-}" ] || out+=$line$'\n'
         done <<<"$body"
-        for p in "$@"; do out+="${M_ANCESTOR[$p]:-} $p"$'\n'; done
+        for p in "$@"; do out+="${ancestor[$p]:-} $p"$'\n'; done
         body=${out%$'\n'}
     fi
     local bit=sync; [ $# -eq 0 ] || bit=diverged
@@ -1141,28 +1174,29 @@ sync_unit() {
     bundle_git "$dir" || return 1   # before the probe: the bundle is content to classify
     probe_unit "$dir"
 
-    case "$DRIFT" in
-        '?') printf '%s: cannot read the cloud for %s\n' "$PROG" "$spec" >&2; return 1 ;;
-        '=') # Content agrees, but the ancestors may not: a conflict reconciled
+    case "$DRIFT_BASIS:$DRIFT" in
+        unreadable:*) warn 'cannot read the cloud for %s' "$spec"; return 1 ;;
+        *:'=') # Content agrees, but the ancestors may not: a conflict reconciled
              # by hand leaves the manifest holding versions neither side has,
              # and the next edit would read 'both' against them. So re-record
              # unconditionally — the stored prompt bit cannot stand in for
              # "manifest is current", since any `status` over agreeing content
              # writes 'sync' regardless of what the manifest holds.
-             local keep0; keep0=$(list_side local "$dir") || return 1
-             sync_point "$rp" "$spec" "$keep0" || return 1
-             printf '%s: %s in sync\n' "$PROG" "$spec"
+             local shared; shared=$(list_side local "$dir") || return 1
+             sync_point "$rp" "$spec" "$shared" || return 1
+             info '%s in sync' "$spec"
              return 0 ;;
     esac
-    if [ -z "$DRIFT_FILES" ]; then
-        case "$DRIFT" in
-            '>') push_unit "$dir"; return ;;   # no cloud prefix yet: sync = first push
-            '<') pull_unit "$dir"; return ;;   # nothing local to lose: sync = plain pull
-        esac
-        printf '%s: %s has never been synced from this machine; choose a side\n' "$PROG" "$spec" >&2
-        printf "%s: with '%s push --force' or '%s pull --force'\n" "$PROG" "$PROG" "$PROG" >&2
-        return 1
-    fi
+    # Without a comparison there is one safe direction, or none. The probe
+    # above stands in for the guard, and the bundle is already fresh.
+    case "$DRIFT_BASIS:$DRIFT" in
+        absent:*)         send_unit "$dir"; return ;;     # no cloud prefix yet: a first push
+        unbaselined:'<')  load_ignore "$dir" "$rp" || return 1
+                          fetch_unit "$dir"; return ;;    # nothing local to lose: a plain pull
+        unbaselined:*)    warn '%s has never been synced from this machine; choose a side' "$spec"
+                          warn "with '%s push --force' or '%s pull --force'" "$PROG" "$PROG"
+                          return 1 ;;
+    esac
 
     local line cls shape path
     local -a up=() down=() conflicts=()
@@ -1177,23 +1211,23 @@ sync_unit() {
         esac
     done <<<"$DRIFT_FILES"
 
-    local keep; keep=$(list_side local "$dir") || return 1
+    local shared; shared=$(list_side local "$dir") || return 1
     if [ ${#down[@]} -gt 0 ]; then
         transfer "$rp" "$dir" "$(printf '%s\n' "${down[@]}")" || return 1
-        keep+=$'\n'$(printf '%s\n' "${down[@]}")
+        shared+=$'\n'$(printf '%s\n' "${down[@]}")
     fi
     if [ ${#up[@]} -gt 0 ]; then
         transfer "$dir" "$rp" "$(printf '%s\n' "${up[@]}")" || return 1
     fi
     claim_unit "$dir" || return 1
     restore_git "$dir"
-    sync_point "$rp" "$spec" "$keep" ${conflicts[@]+"${conflicts[@]}"} || return 1
+    sync_point "$rp" "$spec" "$shared" ${conflicts[@]+"${conflicts[@]}"} || return 1
 
-    printf '%s: %s: %d up, %d down\n' "$PROG" "$spec" "${#up[@]}" "${#down[@]}"
+    info '%s: %d up, %d down' "$spec" "${#up[@]}" "${#down[@]}"
     if [ ${#conflicts[@]} -gt 0 ]; then
-        printf '%s: %d conflicted, untouched on both sides:\n' "$PROG" "${#conflicts[@]}" >&2
+        warn '%d conflicted, untouched on both sides:' "${#conflicts[@]}"
         printf '%s\n' "${conflicts[@]}" | sort | sed 's/^/    /' >&2
-        printf "%s: inspect with '%s resolve %s'\n" "$PROG" "$PROG" "$spec" >&2
+        warn "inspect with '%s resolve %s'" "$PROG" "$spec"
         return 1
     fi
 }
@@ -1212,17 +1246,17 @@ run_batch() {
     for dir in "$@"; do
         i=$((i + 1))
         spec=$(spec_of "$dir")
-        printf '%s: [%d/%d] %s %s\n' "$PROG" "$i" "$n" "${op%_unit}" "$spec"
+        info '[%d/%d] %s %s' "$i" "$n" "${op%_unit}" "$spec"
         set +e; ( set -e; "$op" "$dir" ); status=$?; set -e
         if [ "$status" = 0 ]; then ok=$((ok + 1))
-        else failed+=("$dir"); printf '%s: FAILED %s\n' "$PROG" "$spec" >&2; fi
+        else failed+=("$dir"); warn 'FAILED %s' "$spec"; fi
     done
     if [ ${#failed[@]} -gt 0 ]; then
         local -a fs=(); for dir in "${failed[@]}"; do fs+=("$(spec_of "$dir")"); done
-        printf '%s: %d/%d ok, %d failed: %s\n' "$PROG" "$ok" "$n" "${#failed[@]}" "${fs[*]}" >&2
+        warn '%d/%d ok, %d failed: %s' "$ok" "$n" "${#failed[@]}" "${fs[*]}"
         return 1
     fi
-    printf '%s: %d/%d ok\n' "$PROG" "$ok" "$n"
+    info '%d/%d ok' "$ok" "$n"
 }
 
 # Run a per-unit op on the unit <dir> names (as <resolver> finds it), or else
@@ -1239,7 +1273,7 @@ run_units() {   # <op> <resolver> [<dir>]
     else
         [ "$MIRROR" = 0 ] || die "--mirror applies to a single <dir> only"
         here=$(pwd -P); mapfile -t units < <(units_under "$here")
-        [ ${#units[@]} -gt 0 ] || { printf '%s: no units under %s\n' "$PROG" "$here"; return 0; }
+        [ ${#units[@]} -gt 0 ] || { info 'no units under %s' "$here"; return 0; }
     fi
     STEPS=1
     remote_hash_type || die "cannot read the cloud at $BASE"
@@ -1263,7 +1297,7 @@ cmd_init() {
     in_tree && die "already inside a tree rooted at $ROOT"
     [ -e "$PWD/$MARKER" ] && die "$MARKER already exists here"
     printf '%s\n' "$base" > "$PWD/$MARKER"
-    printf '%s: initialized root at %s -> %s\n' "$PROG" "$(pwd -P)" "$base"
+    info 'initialized root at %s -> %s' "$(pwd -P)" "$base"
 }
 
 cmd_list() {
@@ -1303,18 +1337,18 @@ cmd_resolve() {
     stage=$(state_path "$spec")/conflict
     probe_unit "$target"
 
-    case "$DRIFT" in
-        '?')  die "cannot read the cloud for $spec — nothing to compare against" ;;
-        '<>') ;;
-        *)    rm -rf "$stage"
-              printf '%s: no conflict in %s (%s)\n' "$PROG" "$spec" "$DRIFT"; return 0 ;;
+    case "$DRIFT_BASIS:$DRIFT" in
+        unreadable:*) die "cannot read the cloud for $spec — nothing to compare against" ;;
+        *:'<>') ;;
+        *)      rm -rf "$stage"
+                info 'no conflict in %s (%s)' "$spec" "$DRIFT"; return 0 ;;
     esac
 
-    # A '<>' with no per-file detail is the no-baseline case: nothing here has
-    # ever been reconciled, so there is no conflicting subset to single out.
-    if [ -z "$DRIFT_FILES" ]; then
+    # Never synced from here: nothing has been reconciled, so there is no
+    # conflicting subset to single out.
+    if [ "$DRIFT_BASIS" = unbaselined ]; then
         rm -rf "$stage"
-        printf '%s: %s has never been synced from this machine, so both sides are\n' "$PROG" "$spec"
+        info '%s has never been synced from this machine, so both sides are' "$spec"
         printf '  unreconciled in full. Compare with '\''rclone ls %s'\'', then push or pull\n' "$rp"
         printf '  with --force to choose a side.\n'
         return 0
@@ -1322,9 +1356,9 @@ cmd_resolve() {
 
     # Everything the cloud touched — the versions you cannot see from here. Files
     # only you changed need no staging: your copy is already the one in hand.
-    local -a wanted=(); local -A label=(); local cls shape rest path
+    local -a wanted=(); local -A label=(); local cls shape path
     while IFS= read -r line; do
-        cls=${line%% *}; rest=${line#* }; shape=${rest%% *}; path=${rest#* }
+        drift_fields "$line"
         # A file the cloud deleted has no version to stage; the rest do.
         [ "$shape" = delete ] && continue
         case "$cls" in
@@ -1334,11 +1368,10 @@ cmd_resolve() {
     done <<<"$DRIFT_FILES"
     if [ ${#wanted[@]} -eq 0 ]; then
         rm -rf "$stage"
-        printf '%s: nothing of the cloud'\''s to stage for %s — it differs by deletions\n' "$PROG" "$spec"
+        info 'nothing of the cloud'\''s to stage for %s — it differs by deletions' "$spec"
         printf '  and changes of your own:\n'
         print_drift_files "$DRIFT_FILES"
-        printf "%s: '%s push' keeps your side, '%s pull --mirror' accepts the deletions\n" \
-            "$PROG" "$PROG" "$PROG"
+        info "'%s push' keeps your side, '%s pull --mirror' accepts the deletions" "$PROG" "$PROG"
         return 0
     fi
 
@@ -1360,24 +1393,23 @@ cmd_resolve() {
     done
     if [ ${#staged[@]} -eq 0 ]; then
         rm -rf "$stage.new" "$stage"
-        printf '%s: the cloud no longer holds %s — deleted there, not edited\n' "$PROG" "${absent[*]}"
-        printf "%s: '%s push --force' restores it, '%s pull --mirror' accepts the deletion\n" \
-            "$PROG" "$PROG" "$PROG"
+        info 'the cloud no longer holds %s — deleted there, not edited' "${absent[*]}"
+        info "'%s push --force' restores it, '%s pull --mirror' accepts the deletion" "$PROG" "$PROG"
         return 0
     fi
     rm -rf "$stage"; mv "$stage.new" "$stage"
 
-    printf '%s: the cloud version of %d file(s) is in\n  %s\n' "$PROG" "${#staged[@]}" "$stage"
+    info 'the cloud version of %d file(s) is in\n  %s' "${#staged[@]}" "$stage"
     for path in "${staged[@]}"; do printf '    %s   (%s)\n' "$path" "${label[$path]}"; done
-    [ ${#absent[@]} -eq 0 ] || printf '%s: deleted on the cloud, nothing to stage: %s\n' "$PROG" "${absent[*]}"
+    [ ${#absent[@]} -eq 0 ] || info 'deleted on the cloud, nothing to stage: %s' "${absent[*]}"
     if [ -d "$target/.git" ] && [ -e "$stage/history.bundle" ]; then
-        printf '%s: the histories share a merge base, so\n' "$PROG"
+        info 'the histories share a merge base, so'
         printf '  git -C %s fetch %s/history.bundle "refs/heads/*:refs/remotes/ferry/*"\n' "$target" "$stage"
         printf '  gives you the other side as branches to merge.\n'
     fi
     # Not a plain push: a merged file matches neither side, so the guard still
     # sees a conflict. Forcing is the point — you have now looked at both.
-    printf "%s: reconcile in place, then '%s push --force' to publish your result\n" "$PROG" "$PROG"
+    info "reconcile in place, then '%s push --force' to publish your result" "$PROG"
 }
 
 # Create a brand-new unit locally; the cloud prefix materializes on first push.
@@ -1395,7 +1427,7 @@ cmd_new() {
     mkdir -p "$target"
     claim_unit "$target"
     mark_synced "$(spec_of "$target")" ''
-    printf '%s: created unit %s (push to materialize on the cloud)\n' "$PROG" "$(spec_of "$target")"
+    info 'created unit %s (push to materialize on the cloud)' "$(spec_of "$target")"
 }
 
 # The daily verb: direction comes from the classification, not from the user.
@@ -1415,14 +1447,14 @@ cmd_drop() {
     refuse_cwd_inside "$target"
     local spec; spec=$(spec_of "$target")
     probe_unit "$target"        # the same classifier status uses: direction matters here
-    case "$DRIFT" in
-        *'>'*) printf '%s: WARNING — local has changes not on the cloud (unpushed).\n' "$PROG" >&2 ;;
-        '?')   printf '%s: WARNING — could not read the cloud to check for unpushed changes.\n' "$PROG" >&2 ;;
+    case "$DRIFT_BASIS:$DRIFT" in
+        unreadable:*) warn 'WARNING — could not read the cloud to check for unpushed changes.' ;;
+        *:*'>'*)      warn 'WARNING — local has changes not on the cloud (unpushed).' ;;
     esac
     confirm "Delete local $target? (cloud keeps its copy)"
     rm -rf "$target"
     rm -rf "$(state_path "$spec")"
-    printf '%s: dropped %s (cloud retains it)\n' "$PROG" "$spec"
+    info 'dropped %s (cloud retains it)' "$spec"
 }
 
 # Delete a unit on BOTH sides. Restricted to a local unit: cloud-only paths are
@@ -1436,10 +1468,10 @@ cmd_rm() {
     # that also loses the one copy we could still see.
     [ "$rstate" = 2 ] && die "cannot reach the cloud for $spec — refusing to delete the local copy alone"
     confirm "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"
-    [ "$rstate" = 0 ] && run_rclone purge "$rp"
-    [ -e "$target" ] && rm -rf "$target"
+    [ "$rstate" != 0 ] || run_rclone purge "$rp"
+    rm -rf "$target"
     rm -rf "$(state_path "$spec")"
-    printf '%s: removed %s from both sides\n' "$PROG" "$spec"
+    info 'removed %s from both sides' "$spec"
 }
 
 # Rename/move a unit or grouping dir. Cloud is authoritative: move there first, then
@@ -1476,13 +1508,13 @@ cmd_mv() {
 
     if [ "$old_state" = 0 ]; then
         run_rclone moveto "$old_rp" "$new_rp"
-        printf '%s: moved on cloud %s -> %s\n' "$PROG" "$old_spec" "$new_spec"
+        info 'moved on cloud %s -> %s' "$old_spec" "$new_spec"
     fi
 
     if [ -e "$old_abs" ]; then
         mkdir -p "$(dirname "$new_abs")"
         mv "$old_abs" "$new_abs"
-        printf '%s: renamed local %s -> %s\n' "$PROG" "$old_spec" "$new_spec"
+        info 'renamed local %s -> %s' "$old_spec" "$new_spec"
     fi
 
     local so sn; so=$(state_path "$old_spec"); sn=$(state_path "$new_spec")
