@@ -343,6 +343,16 @@ downgrade_manifest h
 check 'without ancestor hashes the listing returns' '1' "$(trace_of status h | grep -c ' lsf ')"
 check '  and still attributes by mtime' '>' "$(symbol_of h)"
 
+printf '\n== RCLONE_BASE64 never changes how digests are read ==\n'
+reset_tree; synced_unit b64
+printf 'edited here\n' > "$WORK/b64/doc.txt"
+check 'a hash-backed edit is still attributed' '>' "$(RCLONE_BASE64=true symbol_of b64)"
+check '  without falling back to a listing' '0' \
+    "$(RCLONE_BASE64=true trace_of status b64 | grep -c ' lsf ')"
+RCLONE_BASE64=true ferry push b64 >/dev/null 2>&1
+check '  and the manifest stays hex' "$(md5sum "$CLOUD/b64/doc.txt" | awk '{print $1}') doc.txt" \
+    "$(sed -n 2p "$(state_of b64)/manifest")"
+
 printf '\n== a push records its manifest from one hashsum pass ==\n'
 reset_tree; ferry new m >/dev/null
 printf 'x\n' > "$WORK/m/doc.txt"

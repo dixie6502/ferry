@@ -582,17 +582,22 @@ remote_listing() {   # <remote>
         --time-format max "${UNIT_EXCLUDE[@]}" "$1" | tally 'files listed'
 }
 
+# `rclone hashsum`, always in hex. Manifests store digests across runs and
+# the parsers read hex, so RCLONE_BASE64 in the environment must not switch the
+# encoding: a flag outranks it.
+rclone_hashsum() { rclone_quiet hashsum --base64=false "$@"; }
+
 # `rclone hashsum` output ("<hash>  <path>") for the paths on stdin, one per
 # line, under a local dir or a remote — looked up in parallel (--checkers).
 # Returns non-zero if rclone failed.
 hash_paths() {   # <hash type> <local dir or remote>
-    rclone_quiet hashsum "$1" --files-from-raw - "$2" | tally 'files hashed'
+    rclone_hashsum "$1" --files-from-raw - "$2" | tally 'files hashed'
 }
 
 # The same for every file of a unit on the cloud, under the unit's exclusions.
 remote_hashes() {   # <hash type> <remote>
     step 'reading cloud hashes'
-    rclone_quiet hashsum "$1" "${UNIT_EXCLUDE[@]}" "$2" | tally 'files hashed'
+    rclone_hashsum "$1" "${UNIT_EXCLUDE[@]}" "$2" | tally 'files hashed'
 }
 
 # Split one `rclone hashsum` line, "<digest>  <path>", into the caller's
@@ -608,7 +613,7 @@ split_hashsum_line() {   # <line>
         *) line_hash=$digest line_path=${1#*  }; return 0 ;;
     esac
     if [ "$HASH_WIDTH" = 0 ]; then
-        digest=$(printf '' | rclone_quiet hashsum "$HASH_TYPE" -) ||
+        digest=$(printf '' | rclone_hashsum "$HASH_TYPE" -) ||
             { warn 'cannot learn the %s digest width from rclone' "$HASH_TYPE"; return 1; }
         digest=${digest%%  *}
         HASH_WIDTH=${#digest}
