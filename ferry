@@ -33,7 +33,8 @@
 #   ferry completion bash emit a bash completion script (eval from your shell rc)
 #
 # Flags: --mirror (propagate deletions; push/pull, single <dir> only), --force
-# (skip the pre-transfer drift guard; push/pull), -y/--yes (skip prompts).
+# (skip the pre-transfer drift guard; push/pull), -y/--yes (skip prompts),
+# -v/--verbose (trace every rclone call and pass it -v).
 # sync takes neither: it has no direction to delete on or to prefer.
 #
 # Requires: bash, rclone (with the remote configured), git.
@@ -78,10 +79,68 @@ DRIFT_FILES=''
 MIRROR=0
 FORCE=0
 
+# --verbose: echo each rclone command and let rclone log at INFO.
+# STEPS: announce each phase of a unit's run (set for the transferring verbs
+# and by --verbose), so a slow cloud reads as slow, not as hung.
+VERBOSE=0
+STEPS=0
+
+# File descriptor for step and trace lines: the terminal's stderr, saved by
+# main before any function redirects fd 2 into a capture.
+LOG_FD=2
+
 # --- helpers ----------------------------------------------------------------
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 
 require() { command -v "$1" >/dev/null || die "$1 not found"; }
+
+# Announce a phase of the current unit's run (see STEPS).
+step() {
+    [ "$STEPS" = 1 ] || return 0
+    printf '%s:   %s\n' "$PROG" "$*" >&"$LOG_FD"
+}
+
+# --- rclone -----------------------------------------------------------------
+# Every rclone call goes through run_rclone, which traces it under --verbose
+# (main exports RCLONE_VERBOSE for rclone's own logging).
+run_rclone() {
+    if [ "$VERBOSE" = 1 ]; then
+        printf '%s: + rclone%s\n' "$PROG" "$(printf ' %q' "$@")" >&"$LOG_FD"
+    fi
+    rclone "$@"
+}
+
+# Short limits for the calls that read the cloud before anything moves.
+# rclone's defaults (1m connect timeout, 5m idle timeout, 3 retries of 10
+# low-level retries each) can keep an unreachable cloud silent for many
+# minutes; these fail within about a minute. Transfers keep the defaults: they
+# show progress, and their retries ride out rate limits and slow finalising.
+# Flags outrank rclone's environment, so a limit the user set there is left out.
+run_probe() {
+    local -a limits=()
+    [ -n "${RCLONE_CONTIMEOUT:-}" ]        || limits+=(--contimeout 15s)
+    [ -n "${RCLONE_TIMEOUT:-}" ]           || limits+=(--timeout 1m)
+    [ -n "${RCLONE_RETRIES:-}" ]           || limits+=(--retries 1)
+    [ -n "${RCLONE_LOW_LEVEL_RETRIES:-}" ] || limits+=(--low-level-retries 3)
+    run_rclone ${limits[@]+"${limits[@]}"} "$@"
+}
+
+# Print a finished rclone call's held-back log, prefixed: when it failed ($1=1),
+# so the failure names its cause (auth, quota, network) instead of collapsing
+# into "cannot read the cloud"; and under --verbose, always.
+show_rclone_log() {   # <is failure: 0|1> <log>
+    [ "$1" = 1 ] || [ "$VERBOSE" = 1 ] || return 0
+    if [ -n "$2" ]; then sed "s/^/$PROG: rclone: /" <<<"$2" >&2; fi
+}
+
+# run_probe with stderr held back for show_rclone_log: a probe that succeeds
+# stays quiet, one that fails says why. Stdout passes through.
+rclone_quiet() {
+    local err status=0
+    { err=$(run_probe "$@" 2>&1 >&3 3>&-); } 3>&1 || status=$?
+    show_rclone_log "$((status != 0))" "$err"
+    return "$status"
+}
 
 # Reject absolute paths and '..' traversal in a user-supplied name.
 validate_name() {
@@ -294,8 +353,9 @@ load_ignore() {   # <unit dir>
 # for a path that is not there and for one behind an unreadable parent, so those
 # two stay conflated; every other failure is reported as trouble.
 remote_state() {
-    local status=0
-    rclone lsjson "$1" >/dev/null 2>&1 || status=$?
+    local err status=0
+    err=$(run_probe lsjson "$1" 2>&1 >/dev/null) || status=$?
+    case $status in 0|3) show_rclone_log 0 "$err" ;; *) show_rclone_log 1 "$err" ;; esac
     case $status in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
@@ -309,7 +369,7 @@ HASH_PROBED=0 HASH_TYPE=''
 remote_hash_type() {
     [ "$HASH_PROBED" = 1 ] && return 0
     local out flat h=''
-    out=$(rclone backend features "$BASE" 2>/dev/null) || return 1
+    out=$(rclone_quiet backend features "$BASE") || return 1
     flat=$(tr -d '\n\t" ' <<<"$out")
     case $flat in *Hashes:\[*) h=${flat#*Hashes:[}; h=${h%%]*}; h=${h%%,*} ;; esac
     HASH_TYPE=$h HASH_PROBED=1
@@ -345,11 +405,12 @@ record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/remote"; }
 # Times are rendered in UTC: local-time strings go backwards across a DST
 # fall-back, and the baseline cutoff compares them lexicographically.
 remote_listing() {   # <hash type or ''> <remote>
+    step 'listing the cloud'
     if [ -n "$1" ]; then
-        TZ=UTC rclone lsf -R --files-only --format thp --separator ';' \
+        TZ=UTC rclone_quiet lsf -R --files-only --format thp --separator ';' \
             --time-format max --hash "$1" "${UNIT_EXCLUDE[@]}" "$2"
     else
-        TZ=UTC rclone lsf -R --files-only --format tp --separator ';' \
+        TZ=UTC rclone_quiet lsf -R --files-only --format tp --separator ';' \
             --time-format max "${UNIT_EXCLUDE[@]}" "$2" | sed 's/^[^;]*;/&;/'
     fi
 }
@@ -503,23 +564,24 @@ classify_unit() {
     # every log line starts with rclone's timestamp.
     # --log-format pinned: the summary parse below keys on the timestamp
     # prefix, and a user's RCLONE_LOG_FORMAT would otherwise change it.
-    local output status=0 differences errors
-    output=$(rclone check --combined - --log-format 'date,time' \
+    local output status=0 differences errors trouble=0
+    output=$(run_probe check --combined - --log-format 'date,time' \
         "${UNIT_EXCLUDE[@]}" "$dir" "$rp" 2>&1) || status=$?
-    if [ "$status" -gt 1 ]; then return 1; fi
-    if [ "$status" = 1 ]; then
+    if [ "$status" -gt 1 ]; then trouble=1
+    elif [ "$status" = 1 ]; then
         # Counters come only from the timestamped NOTICE summary lines, matched
         # to the line's end — a report line is "<flag> <path>", and a path such
         # as "0 errors while checking.txt" could otherwise spoof them.
         differences=$(sed -nE \
             's|^[0-9]{4}/.* NOTICE: .*[^0-9]([0-9]+) differences found$|\1|p' \
             <<<"$output" | tail -1)
-        [ -n "$differences" ] || return 1
         errors=$(sed -nE \
             's|^[0-9]{4}/.* NOTICE: .*[^0-9]([0-9]+) errors while checking$|\1|p' \
             <<<"$output" | tail -1)
-        [ "${errors:-0}" -le "$differences" ] || return 1
+        if [ -z "$differences" ] || [ "${errors:-0}" -gt "$differences" ]; then trouble=1; fi
     fi
+    show_rclone_log "$trouble" "$(sed -nE '/^[0-9]{4}\//p' <<<"$output")"
+    [ "$trouble" = 0 ] || return 1
 
     # One pass over the report — the "<flag> <path>" grammar is parsed only
     # here (a path may hold spaces; '=' lines are identical files).
@@ -530,6 +592,7 @@ classify_unit() {
         flags+=("${line:0:1}"); paths+=("${line:2}"); flagged[${line:2}]=1
     done <<<"$output"
     [ ${#paths[@]} -gt 0 ] || return 0    # nothing differs: no listing to consult
+    step "${#paths[@]} file(s) differ"
 
     # One remote listing carries every cloud file's current hash (primary) and
     # mtime (fallback); only the flagged files are ever consulted, so only they
@@ -538,7 +601,7 @@ classify_unit() {
     # agree, and the baseline cutoff keeps the same precision.
     local cutoff listing rest
     cutoff=$(TZ=UTC date '+%Y-%m-%d %H:%M:%S.%N' -r "$base")
-    listing=$(remote_listing "$M_TYPE" "$rp" 2>/dev/null) || return 1
+    listing=$(remote_listing "$M_TYPE" "$rp") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         rest=${line#*;}; p=${rest#*;}
@@ -557,12 +620,13 @@ classify_unit() {
         esac
     done
     if [ ${#lneed[@]} -gt 0 ]; then
+        step "hashing ${#lneed[@]} local file(s)"
         while IFS= read -r line; do
             h=${line%%  *}
             case $h in ''|*[!0-9a-f]*) continue ;; esac
             lhash[${line#*  }]=$h
         done < <(printf '%s\n' "${lneed[@]}" |
-            rclone hashsum "$M_TYPE" --files-from-raw - "$dir" 2>/dev/null)
+            rclone_quiet hashsum "$M_TYPE" --files-from-raw - "$dir")
     fi
 
     for i in "${!paths[@]}"; do
@@ -634,6 +698,7 @@ probe_unit() {
     rp=$(remote_of "$dir"); sd=$(state_path "$(spec_of "$dir")"); base=$sd/$BASELINE
     DRIFT_FILES=''
 
+    step 'comparing with the cloud'
     remote_state "$rp" || reachable=$?
     if [ "$reachable" = 2 ]; then
         DRIFT='?'; return 0          # could not look; see the '?' note below
@@ -689,19 +754,30 @@ probe_unit() {
 # the plain variant reads '#'/';' names as comments), which is safe here: the
 # lists come from a classification that already ran under UNIT_EXCLUDE, so
 # nothing ignored can reach one.
+#
+# Progress: live on a terminal; elsewhere (a log, a pipe) --progress would
+# write redraw codes, so a one-line summary every 10s instead, raised to NOTICE
+# so it prints without -v. The direction is read off src: remote paths are
+# always under $BASE.
 transfer() {
-    local src=$1 dst=$2 files=${3:-} verb=copy
+    local src=$1 dst=$2 files=${3:-} verb=copy way=uploading count=''
     [ "$MIRROR" = 1 ] && verb=sync
+    case $src in "$BASE"*) way=downloading ;; esac
+    [ -z "$files" ] || count=" $(grep -c '' <<<"$files") file(s)"
+    step "$way$count"
     remote_hash_type || return 1
+    local -a progress=(--progress)
+    [ -t 2 ] || progress=(--stats 10s --stats-one-line --stats-log-level NOTICE)
     if [ -n "$files" ]; then
         # Fed on stdin: rclone re-reads the filter file while initialising, so
         # a process-substitution path would already be gone.
-        printf '%s\n' "$files" | rclone "$verb" --files-from-raw - \
-            --ignore-times --progress "$src" "$dst"
+        printf '%s\n' "$files" | run_rclone "$verb" --files-from-raw - \
+            --ignore-times "${progress[@]}" "$src" "$dst"
     else
         local -a flags=()
         [ -n "$HASH_TYPE" ] && flags+=(--checksum)
-        rclone "$verb" ${flags[@]+"${flags[@]}"} "${UNIT_EXCLUDE[@]}" --progress "$src" "$dst"
+        run_rclone "$verb" ${flags[@]+"${flags[@]}"} "${UNIT_EXCLUDE[@]}" \
+            "${progress[@]}" "$src" "$dst"
     fi
 }
 
@@ -981,7 +1057,7 @@ cmd_init() {
 }
 
 cmd_list() {
-    rclone lsf --dirs-only --format "tp" --separator '  ' \
+    run_rclone lsf --dirs-only --format "tp" --separator '  ' \
         "$(remote_of "$(resolve_target "${1:-}")")" | sort -k3
 }
 
@@ -1060,7 +1136,8 @@ cmd_resolve() {
     # leading '#' or ';' as a comment and trims surrounding whitespace — it would
     # silently skip legitimate filenames.
     rm -rf "$stage.new"; mkdir -p "$stage.new"
-    printf '%s\n' "${wanted[@]}" | rclone copy --files-from-raw - "$rp" "$stage.new" \
+    step "staging ${#wanted[@]} cloud file(s)"
+    printf '%s\n' "${wanted[@]}" | run_rclone copy --files-from-raw - "$rp" "$stage.new" \
         || die "could not stage the cloud version of $spec"
 
     # rclone reports "nothing to transfer" as success, so a path the cloud turns
@@ -1183,7 +1260,7 @@ cmd_rm() {
     # that also loses the one copy we could still see.
     [ "$rstate" = 2 ] && die "cannot reach the cloud for $spec — refusing to delete the local copy alone"
     confirm "$yes" "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"
-    [ "$rstate" = 0 ] && rclone purge "$rp"
+    [ "$rstate" = 0 ] && run_rclone purge "$rp"
     [ -e "$target" ] && rm -rf "$target"
     rm -rf "$(state_path "$spec")"
     printf '%s: removed %s from both sides\n' "$PROG" "$spec"
@@ -1201,7 +1278,7 @@ cmd_mv() {
     [ -e "$new_abs" ] && die "local target exists: $new_abs"
     local old_spec new_spec; old_spec=$(spec_of "$old_abs"); new_spec=$(spec_of "$new_abs")
 
-    rclone moveto "$(remote_of "$old_abs")" "$(remote_of "$new_abs")"
+    run_rclone moveto "$(remote_of "$old_abs")" "$(remote_of "$new_abs")"
     printf '%s: moved on cloud %s -> %s\n' "$PROG" "$old_spec" "$new_spec"
 
     if [ -e "$old_abs" ]; then
@@ -1239,7 +1316,7 @@ _ferry() {
 
     # Flags, offered only for the verbs that accept them.
     if [ "${cur:0:1}" = - ]; then
-        flags='-h --help'
+        flags='-h --help -v --verbose'
         case $verb in
             pull|push) flags="$flags --mirror --force" ;;
             drop|rm)   flags="$flags -y --yes" ;;
@@ -1276,11 +1353,16 @@ main() {
             --mirror) MIRROR=1 ;;
             --force)  FORCE=1 ;;
             -y|--yes) yes=1 ;;
+            -v|--verbose) VERBOSE=1 STEPS=1 ;;
             -*)       die "unknown flag: $a" ;;
             *)        args+=("$a") ;;
         esac
     done
     set -- "${args[@]+"${args[@]}"}"
+
+    exec {LOG_FD}>&2
+    case "$verb" in sync|pull|push|resolve) STEPS=1 ;; esac
+    [ "$VERBOSE" = 0 ] || export RCLONE_VERBOSE=1
 
     # init and completion need neither rclone nor an enclosing tree; the rest do.
     case "$verb" in

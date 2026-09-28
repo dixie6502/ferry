@@ -174,6 +174,18 @@ continues (additive copy is idempotent, so re-running resumes), ending with an
   interrupted deletion-sync is unsafe.
 - `--force` — skip the drift guard below (and the probe it costs).
 - `-y` — skip confirmation prompts (`drop`, `rm`).
+- `-v` / `--verbose` — echo every rclone command and run it with `-v`.
+
+`sync`/`pull`/`push`/`resolve` always announce each phase (comparing, listing,
+hashing, uploading…) on stderr, and a failed rclone call prints its own error
+rather than a bare `cannot read the cloud`. Transfers show live progress on a
+terminal and a one-line summary every 10s otherwise. The reads that precede a
+transfer (drift check, listings) run with short limits (`--contimeout 15s
+--timeout 1m --retries 1 --low-level-retries 3`), so an unreachable cloud fails
+in under a minute instead of hanging; setting `RCLONE_CONTIMEOUT`,
+`RCLONE_TIMEOUT`, `RCLONE_RETRIES` or `RCLONE_LOW_LEVEL_RETRIES` overrides the
+matching limit. Transfers keep rclone's defaults, so they retry through rate
+limits.
 
 ### Diverged units
 
@@ -265,7 +277,7 @@ eval "$(ferry completion bash)"
 ```
 
 It completes verbs, each verb's accepted flags (`--mirror` on `pull`/`push`,
-`-y`/`--yes` on `drop`/`rm`), and directory arguments. Only bash is supported.
+`-y`/`--yes` on `drop`/`rm`, `-v`/`--verbose` everywhere), and directory arguments. Only bash is supported.
 
 ## Prompt indicator
 
