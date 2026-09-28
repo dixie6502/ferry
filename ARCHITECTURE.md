@@ -167,7 +167,12 @@ The cloud is authoritative, so `mv` renames there first (`rclone moveto`, a
 server-side move where the backend supports it), then realigns the local copy.
 Because names mirror remote and no per-node path is stored, the move recomputes
 every descendant's remote for free. It refuses to run from inside the path being
-moved (which would leave the shell on a dead directory). Doing the rename locally
+moved (which would leave the shell on a dead directory), and refuses a
+destination that exists on either side: `rclone moveto` onto an existing cloud
+directory merges into it, overwriting same-named files. A source the cloud does
+not hold yet (a unit never pushed) is moved locally only — unless it shared
+files with the cloud at its last sync: rclone reports a path behind an
+unreadable parent as absent too, and a local-only move would orphan that copy. Doing the rename locally
 and pushing instead would orphan the old path on the cloud, since `push` is
 additive.
 
@@ -273,14 +278,15 @@ one of:
 |---|---|---|---|
 | `name` | a file or directory `name`, any depth | `--exclude name` + `name/**` | `-name name -prune` |
 | `name/` | a directory `name`, any depth | `--exclude 'name/**'` | `-name name -type d -prune` |
-| `*.ext` | a glob (`*`, `?`, `[…]`) over a name, any depth | `--exclude '*.ext'` | `-name '*.ext' -prune` |
+| `*.ext` | a glob (`*`, `?`, `[…]`, `[^…]`) over a name, any depth | `--exclude '*.ext'` | `-name '*.ext' -prune` |
 | `/a/b`, `/a/b/` | a literal path from the unit's top | `--exclude /a/b` (+ `/**`) | `-path <unit>/a/b -prune` |
 
 Everything else is a **fatal** error, not a skipped line: `!` re-inclusion, `**`
-(a bare name already matches at any depth), an unanchored `a/b` (gitignore anchors
-it, rclone does not — write `/a/b`), and a glob inside an anchored pattern
-(`find -path` lets `*` cross a `/`, rclone does not, so the two would mean
-different things). Continuing past a malformed rule would transfer files the user
+(a bare name already matches at any depth), `{a,b}` alternation and `[!…]`
+negation (`find` has no alternation, and rclone reads `!` as a literal), an
+unanchored `a/b` (gitignore anchors it, rclone does not — write `/a/b`), and a
+glob inside an anchored pattern (`find -path` lets `*` cross a `/`, rclone does
+not, so the two would mean different things). Continuing past a malformed rule would transfer files the user
 asked to keep out; failing the run is the cheap, loud alternative.
 
 **Ignoring is not deleting.** A rule removes a path from ferry's view on *both*

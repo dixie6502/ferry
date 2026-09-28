@@ -40,6 +40,10 @@
 # Requires: bash, rclone (with the remote configured), git.
 
 set -euo pipefail
+# A command substitution runs with errexit too, so a failure inside `x=$(...)`
+# fails the assignment. A substitution used as an *argument* still does not
+# stop its caller — assign it first.
+shopt -s inherit_errexit
 
 readonly PROG=${0##*/}
 readonly MARKER='.ferry'
@@ -209,8 +213,11 @@ in_tree() {
     done
 }
 
-# Same, but die when there is no enclosing tree.
-find_root() { in_tree || die "not inside a ferry tree (no rooted $MARKER above $PWD)"; }
+# Same, but die when there is no enclosing tree; also adopts legacy state.
+find_root() {
+    in_tree || die "not inside a ferry tree (no rooted $MARKER above $PWD)"
+    adopt_legacy_state
+}
 
 # --- derivations (no I/O) ---------------------------------------------------
 # A node's remote path, derived from its position under the root.
@@ -223,11 +230,19 @@ remote_of() {
 spec_of() { local rel=${1#"$ROOT"}; printf '%s' "${rel#/}"; }
 
 # Absolute path of an optional <dir> argument (relative to $PWD), or $PWD itself.
-# The target need not exist yet (new/pull create it).
+# Normalized lexically — '.' segments and repeated or trailing '/' dropped — so
+# `proj/` (as tab completion writes it), `./proj` and `proj` name one node: the
+# path keys sync state, the remote path and anchored ignore rules alike. The
+# target need not exist yet (new/pull create it).
 resolve_target() {
-    local here; here=$(pwd -P)
-    if [ -n "${1:-}" ]; then validate_name "$1"; printf '%s/%s' "$here" "$1"
-    else printf '%s' "$here"; fi
+    local path rest=${1:-} part; path=$(pwd -P)
+    [ -z "$rest" ] || validate_name "$rest"
+    while [ -n "$rest" ]; do
+        part=${rest%%/*}
+        case $rest in */*) rest=${rest#*/} ;; *) rest='' ;; esac
+        case $part in ''|.) ;; *) path+=/$part ;; esac
+    done
+    printf '%s' "$path"
 }
 
 # --- marker-tree topology ---------------------------------------------------
@@ -256,6 +271,30 @@ refuse_in_unit() {
     local u; if u=$(enclosing_unit "$(dirname "$1")"); then
         die "inside unit '$(spec_of "$u")' — already materialized content"
     fi
+}
+
+# Confer (or refresh) unit status: an empty marker. Never over the root's
+# marker, which holds the base — emptying it would unroot the whole tree.
+claim_unit() {
+    [ ! -s "$1/$MARKER" ] || die "$1 holds a root marker; not making it a unit"
+    : > "$1/$MARKER"
+}
+
+# The unit a single-<dir> pull or push acts on. It need not exist yet (a pull
+# fetches it), but it is never a root (this tree's, or one nested in it) or a
+# grouping node: a transfer there would move every unit below as one, and
+# claiming it would empty the root's marker. Dies otherwise — before anything
+# moves, where claim_unit only catches it after.
+transfer_target() {
+    local target; target=$(resolve_target "$1")
+    [ ! -s "$target/$MARKER" ] || die "'$1' is a tree root, not a unit; run without <dir> to act on every unit"
+    if ! is_unit "$target"; then
+        if [ -d "$target" ] && has_sub_marker "$target"; then
+            die "'$(spec_of "$target")' is a grouping node; name one of its units"
+        fi
+        refuse_in_unit "$target"
+    fi
+    printf '%s' "$target"
 }
 
 # Refuse to act on a path the shell is standing inside (a move/delete would
@@ -300,13 +339,14 @@ units_under() {
 #
 #   name          a file or directory called `name`, at any depth
 #   name/         a directory called `name`, at any depth
-#   *.ext         a glob (`*`, `?`, `[...]`) over a name, at any depth
+#   *.ext         a glob (`*`, `?`, `[...]`, `[^...]`) over a name, at any depth
 #   /a/b, /a/b/   a literal path from the unit's top
 #
 # Rejected, loudly: `!` re-inclusion (rclone's `--exclude` has no equivalent),
-# `**` (a bare name already matches at any depth), and an unanchored `a/b`
-# (gitignore anchors it, rclone does not — so it must be written `/a/b`). An
-# anchored pattern must be literal: `find -path` lets `*` cross a `/` and rclone
+# `{a,b}` alternation and `[!...]` negation (rclone reads them, `find` does not
+# or reads them differently), `**` (a bare name already matches at any depth),
+# and an unanchored `a/b` (gitignore anchors it, rclone does not — so it must
+# be written `/a/b`). An anchored pattern must be literal: `find -path` lets `*` cross a `/` and rclone
 # does not, so a glob there would mean two different things.
 
 # Quote the characters `find -path` reads as glob metacharacters, so a literal
@@ -342,6 +382,8 @@ compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
             '')     die "$file: '$line' — empty pattern" ;;
             '!'*)   die "$file: '$line' — re-inclusion ('!') is not supported" ;;
             *'**'*) die "$file: '$line' — '**' is not supported; a bare name already matches at any depth" ;;
+            *[{}]*) die "$file: '$line' — '{a,b}' alternation is not supported; write one pattern per line" ;;
+            *'[!'*) die "$file: '$line' — '[!...]' is not supported; write the negation as '[^...]'" ;;
         esac
 
         if [[ $pat == */* ]]; then
@@ -373,9 +415,12 @@ compile_ignore() {   # <ignore file label> <unit dir>   (rules on stdin)
 # local copy yet — without this it would list, hash and download everything
 # the unit's own file keeps out (a whole .venv). A cloud that cannot be read
 # fails the load rather than reading as "no rules".
+#
+# A load with a remote always runs: an earlier local-only load of the same unit
+# (sync, before it hands a first pull over) left the cloud's rules out.
 load_ignore() {   # <unit dir> [<remote>]
     local dir=$1 rp=${2:-} f rules errf status=0
-    [ "$IGNORE_LOADED" = "$dir" ] && return 0
+    [ -n "$rp" ] || [ "$IGNORE_LOADED" != "$dir" ] || return 0
     UNIT_EXCLUDE=("${XFER_EXCLUDE[@]}")
     UNIT_PRUNE=("${FIND_PRUNE[@]}")
     if [ -n "${ROOT:-}" ] && [ -f "$ROOT/$IGNORE_FILE" ]; then
@@ -434,7 +479,14 @@ remote_hash_type() {
 # tree's manifest and baseline answer the other's questions — with --mirror
 # acting on the answer. Percent-encoding keeps the key injective: substituting
 # every unsafe byte with '_' maps ':x/a_b' and ':x/a/b' onto one directory.
-state_key() {
+# Byte-wise (LC_ALL=C): per character, a code point past 0xFF prints as more
+# than two hex digits ('€' → %20AC, as ' AC' also encodes) and the key would
+# change with the caller's locale. ferry-prompt.sh encodes the same way.
+state_key() { local LC_ALL=C; percent_encode "$1"; }
+
+# Percent-encode every character outside [A-Za-z0-9._-], per character of the
+# current locale.
+percent_encode() {
     local s=$1 out='' i c
     for (( i = 0; i < ${#s}; i++ )); do
         c=${s:i:1}
@@ -447,6 +499,17 @@ state_key() {
 }
 
 state_path() { printf '%s/%s/%s' "$STATE_ROOT" "$STATE_KEY" "$1"; }
+
+# Move state recorded under the pre-byte-wise key (encoded per character in the
+# user's locale) to STATE_KEY, once. Left in place, a non-ASCII base would lose
+# every baseline, and the guard would then demand --force for every unit.
+# Delete once no such state remains.
+adopt_legacy_state() {
+    local legacy; legacy=$(percent_encode "$BASE")
+    [ "$legacy" != "$STATE_KEY" ] || return 0
+    [ -d "$STATE_ROOT/$legacy" ] && [ ! -e "$STATE_ROOT/$STATE_KEY" ] || return 0
+    mv "$STATE_ROOT/$legacy" "$STATE_ROOT/$STATE_KEY"
+}
 
 # How the cloud stood at the last look, and when — the bit the prompt renders.
 record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/remote"; }
@@ -571,6 +634,12 @@ mark_synced() {
     else : > "$sd/$MANIFEST"; fi
     : > "$sd/$BASELINE"          # touched last: newer than everything it covers
     record_remote_bit "$sd" "$bit"
+}
+
+# True if any unit at or under a node shared a file with the cloud at its last
+# sync: a manifest holding a line that is neither its header nor blank.
+has_shared_files() {   # <spec>
+    grep -rqs --include="$MANIFEST" -v -e '^#ferry ' -e '^$' "$(state_path "$1")"
 }
 
 # True if a unit holds any transferable file (markers and git internals aside).
@@ -876,33 +945,52 @@ transfer() {
 # --- git history sidecar (carried from prj) ---------------------------------
 # Reattach git history from history.bundle to a freshly pulled tree, without
 # overwriting files. Only when a bundle exists and .git does not.
+# A failure only warns: the files have crossed and the sync point must still be
+# recorded. The half-built .git is removed, so the next pull retries.
 restore_git() {
-    local dir=$1 bundle="$1/history.bundle" branch
+    local dir=$1 bundle="$1/history.bundle"
     [ -f "$bundle" ] || return 0
-    [ -d "$dir/.git" ] && return 0
+    [ ! -e "$dir/.git" ] || return 0   # a directory, or a worktree/submodule link
 
     printf '%s: restoring git history from history.bundle\n' "$PROG"
-    git -C "$dir" init -q
-    git -C "$dir" symbolic-ref HEAD refs/heads/__ferry_restore__
-    git -C "$dir" fetch -q "$bundle" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+    if ! attach_bundle "$dir" "$bundle"; then
+        rm -rf "$dir/.git"
+        printf '%s: could not restore git history from %s; the next pull retries\n' "$PROG" "$bundle" >&2
+    fi
+}
 
-    local branches; branches=$(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads/)
+# Init a repository in <dir> from <bundle> and check out its main branch (else
+# its first) without touching the work tree. Every step is checked by hand: a
+# caller's `if` turns errexit off in here.
+attach_bundle() {   # <dir> <bundle>
+    local dir=$1 bundle=$2 branches branch
+    git -C "$dir" init -q || return 1
+    git -C "$dir" symbolic-ref HEAD refs/heads/__ferry_restore__ || return 1
+    git -C "$dir" fetch -q "$bundle" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' || return 1
+    branches=$(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads/) || return 1
     branch=$(grep -Ex 'main|master' <<<"$branches" | head -1 || true)
     [ -n "$branch" ] || branch=$(head -1 <<<"$branches")
-    [ -n "$branch" ] || { printf '%s: bundle has no branches; skipping\n' "$PROG" >&2; return 0; }
-
-    git -C "$dir" symbolic-ref HEAD "refs/heads/$branch"
+    [ -n "$branch" ] || { printf '%s: bundle has no branches\n' "$PROG" >&2; return 1; }
+    git -C "$dir" symbolic-ref HEAD "refs/heads/$branch" || return 1
     git -C "$dir" reset -q
 }
 
-# Snapshot git history into a single file the next push carries up.
+# Snapshot git history into a single file the next push carries up. A failed
+# bundle fails the caller: pushing on would carry a stale history as current.
 bundle_git() {
-    local dir=$1
+    local dir=$1 refs
     [ -d "$dir/.git" ] || return 0
+    # No commits yet: nothing to carry, and git refuses an empty bundle.
+    refs=$(git -C "$dir" for-each-ref --count=1) || return 1
+    [ -n "$refs" ] || return 0
 
     printf '%s: bundling git history\n' "$PROG"
-    git -C "$dir" bundle create "$dir/.history.bundle.tmp" --all
-    mv "$dir/.history.bundle.tmp" "$dir/history.bundle"
+    if ! git -C "$dir" bundle create "$dir/.history.bundle.tmp" --all; then
+        rm -f "$dir/.history.bundle.tmp"
+        printf '%s: could not bundle the git history of %s\n' "$PROG" "$dir" >&2
+        return 1
+    fi
+    mv "$dir/.history.bundle.tmp" "$dir/history.bundle" || return 1
 
     if [ -f "$dir/.gitignore" ] && ! grep -qxF 'history.bundle' "$dir/.gitignore"; then
         printf 'history.bundle\n' >> "$dir/.gitignore"
@@ -979,7 +1067,7 @@ pull_unit() {
     manifest=$(list_side remote "$rp" "$HASH_TYPE") || return 1
     mkdir -p "$dir" || return 1
     transfer "$rp" "$dir" || return 1
-    : > "$dir/$MARKER"            # confer/refresh unit status (empty marker)
+    claim_unit "$dir" || return 1
     restore_git "$dir"
     mark_synced "$(spec_of "$dir")" "$(manifest_v2 "$HASH_TYPE" "$manifest")"
 }
@@ -995,7 +1083,7 @@ push_unit() {
     # exactly sync_point's recipe.
     paths=$(list_side local "$dir") || return 1
     transfer "$dir" "$rp" || return 1
-    : > "$dir/$MARKER"
+    claim_unit "$dir" || return 1
     sync_point "$rp" "$(spec_of "$dir")" "$paths"
 }
 
@@ -1085,7 +1173,7 @@ sync_unit() {
     if [ ${#up[@]} -gt 0 ]; then
         transfer "$dir" "$rp" "$(printf '%s\n' "${up[@]}")" || return 1
     fi
-    : > "$dir/$MARKER"
+    claim_unit "$dir" || return 1
     restore_git "$dir"
     sync_point "$rp" "$spec" "$keep" ${conflicts[@]+"${conflicts[@]}"} || return 1
 
@@ -1100,14 +1188,21 @@ sync_unit() {
 
 # Apply a per-unit op (pull_unit|push_unit|sync_unit) across units, continuing
 # past failures and printing a tally. Returns non-zero if any failed.
+#
+# Each unit runs in a subshell with errexit live. Calling the op as an `if`
+# condition would switch errexit off for its whole body, so a failure the code
+# does not check by hand would pass as success; here it fails the unit, and so
+# does a `die` — never the rest of the batch. The subshell also forgets what a
+# unit memoized, which is why main settles the hash type before any batch.
 run_batch() {
     local op=$1; shift
-    local n=$# i=0 ok=0 dir; local -a failed=()
+    local n=$# i=0 ok=0 dir spec status; local -a failed=()
     for dir in "$@"; do
         i=$((i + 1))
-        local spec; spec=$(spec_of "$dir")
+        spec=$(spec_of "$dir")
         printf '%s: [%d/%d] %s %s\n' "$PROG" "$i" "$n" "${op%_unit}" "$spec"
-        if "$op" "$dir"; then ok=$((ok + 1))
+        set +e; ( set -e; "$op" "$dir" ); status=$?; set -e
+        if [ "$status" = 0 ]; then ok=$((ok + 1))
         else failed+=("$dir"); printf '%s: FAILED %s\n' "$PROG" "$spec" >&2; fi
     done
     if [ ${#failed[@]} -gt 0 ]; then
@@ -1149,8 +1244,8 @@ cmd_init() {
 }
 
 cmd_list() {
-    run_rclone lsf --dirs-only --format "tp" --separator '  ' \
-        "$(remote_of "$(resolve_target "${1:-}")")" | sort -k3
+    local target; target=$(resolve_target "${1:-}")
+    run_rclone lsf --dirs-only --format "tp" --separator '  ' "$(remote_of "$target")" | sort -k3
 }
 
 # Drift for every unit at/under the target (or $PWD): one symbol+spec row each.
@@ -1275,7 +1370,7 @@ cmd_new() {
     [ "$rstate" = 2 ] && die "cannot reach the cloud to check $(remote_of "$target")"
     [ "$rstate" = 0 ] && die "already on cloud: $(remote_of "$target") (use 'pull' to fetch it)"
     mkdir -p "$target"
-    : > "$target/$MARKER"            # confer unit status at birth
+    claim_unit "$target"
     mark_synced "$(spec_of "$target")" ''
     printf '%s: created unit %s (push to materialize on the cloud)\n' "$PROG" "$(spec_of "$target")"
 }
@@ -1298,8 +1393,7 @@ cmd_sync() {
 cmd_pull() {
     local arg=${1:-}
     if [ -n "$arg" ]; then
-        local target; target=$(resolve_target "$arg")
-        is_unit "$target" || refuse_in_unit "$target"   # new unit must not nest in one
+        local target; target=$(transfer_target "$arg")
         run_batch pull_unit "$target"
         return
     fi
@@ -1310,12 +1404,8 @@ cmd_pull() {
 cmd_push() {
     local arg=${1:-}
     if [ -n "$arg" ]; then
-        local target; target=$(resolve_target "$arg")
+        local target; target=$(transfer_target "$arg")
         [ -d "$target" ] || die "no local dir: $target"
-        if ! is_unit "$target"; then
-            has_sub_marker "$target" && die "'$(spec_of "$target")' is a grouping node; push its units"
-            refuse_in_unit "$target"
-        fi
         run_batch push_unit "$target"
         return
     fi
@@ -1361,17 +1451,40 @@ cmd_rm() {
 # Rename/move a unit or grouping dir. Cloud is authoritative: move there first, then
 # realign local and carry the sync-state subtree. Names mirror remote, so every
 # descendant's derived remote follows the move for free.
+#
+# The destination must be free on BOTH sides: `rclone moveto` onto an existing
+# cloud directory merges into it, overwriting same-named files. A source the
+# cloud does not hold (a unit never pushed) moves locally only.
 cmd_mv() {
     local old=${1:-} new=${2:-}
     { [ -n "$old" ] && [ -n "$new" ]; } || die "usage: $PROG mv <old> <new>"
-    validate_name "$old"; validate_name "$new"
     local old_abs new_abs; old_abs=$(resolve_target "$old"); new_abs=$(resolve_target "$new")
-    refuse_cwd_inside "$old_abs"
-    [ -e "$new_abs" ] && die "local target exists: $new_abs"
     local old_spec new_spec; old_spec=$(spec_of "$old_abs"); new_spec=$(spec_of "$new_abs")
+    [ "$old_abs" != "$ROOT" ] || die "the tree root cannot be moved"
+    case "$new_abs/" in "$old_abs/"*) die "cannot move $old_spec into itself" ;; esac
+    refuse_cwd_inside "$old_abs"
+    refuse_in_unit "$old_abs"
+    refuse_in_unit "$new_abs"
+    [ ! -e "$new_abs" ] || die "local target exists: $new_abs"
 
-    run_rclone moveto "$(remote_of "$old_abs")" "$(remote_of "$new_abs")"
-    printf '%s: moved on cloud %s -> %s\n' "$PROG" "$old_spec" "$new_spec"
+    local old_rp new_rp old_state=0 new_state=0
+    old_rp=$(remote_of "$old_abs"); new_rp=$(remote_of "$new_abs")
+    remote_state "$new_rp" || new_state=$?
+    [ "$new_state" != 2 ] || die "cannot read the cloud to check $new_spec"
+    [ "$new_state" = 1 ] || die "cloud target exists: $new_rp"
+    remote_state "$old_rp" || old_state=$?
+    [ "$old_state" != 2 ] || die "cannot read the cloud to check $old_spec"
+    [ "$old_state" = 0 ] || [ -e "$old_abs" ] || die "no such unit or directory: $old_spec"
+    # 'Absent' may also mean 'behind an unreadable parent'. Once a unit has
+    # shared files with the cloud, a local-only move would orphan its copy.
+    if [ "$old_state" = 1 ] && has_shared_files "$old_spec"; then
+        die "the cloud no longer answers for $old_spec, which it held at the last sync; refusing a local-only move"
+    fi
+
+    if [ "$old_state" = 0 ]; then
+        run_rclone moveto "$old_rp" "$new_rp"
+        printf '%s: moved on cloud %s -> %s\n' "$PROG" "$old_spec" "$new_spec"
+    fi
 
     if [ -e "$old_abs" ]; then
         mkdir -p "$(dirname "$new_abs")"
@@ -1460,6 +1573,11 @@ main() {
     case "$verb" in
         init|completion|help|-h|--help) ;;
         *) require rclone; find_root ;;
+    esac
+    # The hash type is fixed for the run: probed once here, before run_batch's
+    # per-unit subshells, so no unit re-probes it and a dead cloud fails fast.
+    case "$verb" in
+        sync|pull|push) remote_hash_type || die "cannot read the cloud at $BASE" ;;
     esac
 
     case "$verb" in

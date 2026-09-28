@@ -15,10 +15,6 @@ SUITE_TMP=ti
 # shellcheck source=tests/common.sh
 source "$(dirname "$0")/common.sh"
 
-# Every cloud file of a unit, one space-joined line — the "what actually went
-# up" assertion the whole suite turns on.
-cloud_of() { rclone lsf -R --files-only "$CLOUD/$1" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '; }
-
 # The exit status and message of a run expected to fail.
 refusal_of() { ferry "$@" 2>&1 >/dev/null | sed 's/.*— //'; }
 
@@ -148,9 +144,22 @@ printf '/x*/y\n' > "$WORK/u/.ferryignore"
 check 'glob in an anchored pattern' "an anchored pattern must be literal (no '*', '?' or '[')" "$(refusal_of status u)"
 ferry push u >/dev/null 2>&1; rc=$?
 check 'and the push is refused as well' '1' "$rc"
+printf '*.{jpg,png}\n' > "$WORK/u/.ferryignore"
+check 'alternation' "'{a,b}' alternation is not supported; write one pattern per line" "$(refusal_of status u)"
+printf '[!b].jpg\n' > "$WORK/u/.ferryignore"
+check '[!...] negation' "'[!...]' is not supported; write the negation as '[^...]'" "$(refusal_of status u)"
 printf '# a comment\n\n*.log\n' > "$WORK/u/.ferryignore"
 ferry push u >/dev/null 2>&1
 check 'comments and blank lines are skipped' '=' "$(symbol_of u)"
+
+printf '\n== [^...] negation means the same to find and rclone ==\n'
+reset_tree
+ferry new u >/dev/null
+printf 'x\n' > "$WORK/u/a.jpg"; printf 'x\n' > "$WORK/u/b.jpg"
+printf '[^b].jpg\n' > "$WORK/u/.ferryignore"
+ferry push u >/dev/null 2>&1
+check 'kept out of the transfer' '.ferryignore b.jpg ' "$(cloud_of u)"
+check '  and out of drift' '=' "$(symbol_of u)"
 
 printf '\n== the prompt applies the same rules ==\n'
 # shellcheck source=/dev/null

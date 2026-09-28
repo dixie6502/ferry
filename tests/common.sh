@@ -34,6 +34,9 @@ state_of() {
     printf '%s/ferry/%s%s' "$XDG_CACHE_HOME" "$key" "${1:+/$1}"
 }
 
+# Every cloud file of a unit, one space-joined line.
+cloud_of() { rclone lsf -R --files-only "$CLOUD/$1" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '; }
+
 check() {
     local label=$1 want=$2 got=$3
     if [ "$want" = "$got" ]; then

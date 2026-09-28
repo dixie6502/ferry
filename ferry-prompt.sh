@@ -77,7 +77,7 @@ __ferry_ps1_ignore() {
         [ -r "$file" ] || continue
         while IFS= read -r line || [ -n "$line" ]; do
             line=${line%$'\r'}
-            case $line in ''|'#'*|'!'*|*'**'*) continue ;; esac
+            case $line in ''|'#'*|'!'*|*'**'*|*[{}]*|*'[!'*) continue ;; esac
             pat=$line dironly=0
             case $pat in */) dironly=1; pat=${pat%/} ;; esac
             case $pat in
@@ -90,6 +90,21 @@ __ferry_ps1_ignore() {
             [ "$dironly" = 1 ] && prune+=(-type d)
             prune+=(-prune -o)
         done < "$file"
+    done
+}
+
+# Percent-encode a remote base into the caller's `key`, byte-wise. Mirrors
+# `ferry`'s state_key — the two must agree or the prompt reads another tree's
+# state. A function of its own so LC_ALL=C stays local to the encoding.
+__ferry_ps1_state_key() {
+    local LC_ALL=C s=$1 i c
+    key=''
+    for (( i = 0; i < ${#s}; i++ )); do
+        c=${s:i:1}
+        case $c in
+            [A-Za-z0-9._-]) key+=$c ;;
+            *) printf -v c '%%%02X' "'$c"; key+=$c ;;
+        esac
     done
 }
 
@@ -134,15 +149,9 @@ __ferry_ps1() {
     # percent-encoding must match `ferry`'s state_key — it is injective, where a
     # plain substitution would map two different bases onto one directory.
     local spec=${unit#"$root"}; spec=${spec#/}
-    local base key='' i c
+    local base key
     base=$(head -1 "$root/$FERRY_MARKER")
-    for (( i = 0; i < ${#base}; i++ )); do
-        c=${base:i:1}
-        case $c in
-            [A-Za-z0-9._-]) key+=$c ;;
-            *) printf -v c '%%%02X' "'$c"; key+=$c ;;
-        esac
-    done
+    __ferry_ps1_state_key "$base"
     local sd=$FERRY_STATE_ROOT/$key${spec:+/$spec}
     local marker=$sd/synced_at
 
