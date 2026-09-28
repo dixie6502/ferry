@@ -179,10 +179,12 @@ continues (additive copy is idempotent, so re-running resumes), ending with an
 `sync`/`pull`/`push`/`resolve` always announce each phase (comparing, listing,
 hashing, uploading…) on stderr, and a failed rclone call prints its own error
 rather than a bare `cannot read the cloud`. Transfers show live progress on a
-terminal and a one-line summary every 10s otherwise. The reads that precede a
+terminal and a one-line summary every 10s otherwise; a slow listing or hashing
+phase shows a running file count the same way. The reads that precede a
 transfer (drift check, listings) run with short limits (`--contimeout 15s
 --timeout 1m --retries 1 --low-level-retries 3`), so an unreachable cloud fails
-in under a minute instead of hanging; setting `RCLONE_CONTIMEOUT`,
+in under a minute instead of hanging — they catch a cloud that stops answering,
+not one that is slow; setting `RCLONE_CONTIMEOUT`,
 `RCLONE_TIMEOUT`, `RCLONE_RETRIES` or `RCLONE_LOW_LEVEL_RETRIES` overrides the
 matching limit. Transfers keep rclone's defaults, so they retry through rate
 limits.
@@ -363,6 +365,7 @@ from them. Scratch trees are built under `tmp/` and reset by each suite.
 
 ## ToDo before going public
 - [x] Bash shell completion (`ferry completion bash`)
+- [x] Verbose flag and default phase output (`-v`/`--verbose`)
 - [ ] Review all code
 - [ ] Optional flag for the rclone remote with a global env variable for a
   default (the remote is currently single-sourced from the root `.ferry`)

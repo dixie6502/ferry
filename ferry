@@ -100,6 +100,26 @@ step() {
     printf '%s:   %s\n' "$PROG" "$*" >&"$LOG_FD"
 }
 
+# Pass stdin through unchanged while counting its lines under the current step
+# (see STEPS): a listing or hashing run that takes minutes shows it is moving.
+# Live on a terminal, redrawn each second; elsewhere a line every 10s. Silent
+# when the run is quick — a count appears only once a full interval has passed.
+tally() {   # <what one line is, e.g. "files listed">
+    if [ "$STEPS" != 1 ]; then cat; return; fi
+    local line n=0 shown=0 interval=1 last=$SECONDS lead=$'\r' tail=''
+    [ -t "$LOG_FD" ] || { interval=10 lead='' tail=$'\n'; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+        n=$((n + 1))
+        if (( SECONDS - last >= interval )); then
+            printf '%s%s:     %d %s%s' "$lead" "$PROG" "$n" "$1" "$tail" >&"$LOG_FD"
+            last=$SECONDS shown=1
+        fi
+    done
+    [ "$shown" = 1 ] || return 0
+    printf '%s%s:     %d %s\n' "$lead" "$PROG" "$n" "$1" >&"$LOG_FD"
+}
+
 # --- rclone -----------------------------------------------------------------
 # Every rclone call goes through run_rclone, which traces it under --verbose
 # (main exports RCLONE_VERBOSE for rclone's own logging).
@@ -408,10 +428,11 @@ remote_listing() {   # <hash type or ''> <remote>
     step 'listing the cloud'
     if [ -n "$1" ]; then
         TZ=UTC rclone_quiet lsf -R --files-only --format thp --separator ';' \
-            --time-format max --hash "$1" "${UNIT_EXCLUDE[@]}" "$2"
+            --time-format max --hash "$1" "${UNIT_EXCLUDE[@]}" "$2" | tally 'files listed'
     else
         TZ=UTC rclone_quiet lsf -R --files-only --format tp --separator ';' \
-            --time-format max "${UNIT_EXCLUDE[@]}" "$2" | sed 's/^[^;]*;/&;/'
+            --time-format max "${UNIT_EXCLUDE[@]}" "$2" | tally 'files listed' |
+            sed 's/^[^;]*;/&;/'
     fi
 }
 
@@ -626,7 +647,7 @@ classify_unit() {
             case $h in ''|*[!0-9a-f]*) continue ;; esac
             lhash[${line#*  }]=$h
         done < <(printf '%s\n' "${lneed[@]}" |
-            rclone_quiet hashsum "$M_TYPE" --files-from-raw - "$dir")
+            rclone_quiet hashsum "$M_TYPE" --files-from-raw - "$dir" | tally 'files hashed')
     fi
 
     for i in "${!paths[@]}"; do
