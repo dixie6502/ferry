@@ -41,6 +41,9 @@ cloud_of() { rclone lsf -R --files-only "$CLOUD/$1" 2>/dev/null | LC_ALL=C sort 
 # "<status>|<line>".
 failure_of() { local out rc=0; out=$(ferry "$@" 2>&1 >/dev/null) || rc=$?; printf '%s|%s' "$rc" "${out%%$'\n'*}"; }
 
+# Rewrite a unit's manifest as v1: bare paths, no header, no hashes.
+downgrade_manifest() { sed -E -i '1d; s/^[^ ]+ //' "$(state_of "$1")/manifest"; }
+
 check() {
     local label=$1 want=$2 got=$3
     if [ "$want" = "$got" ]; then

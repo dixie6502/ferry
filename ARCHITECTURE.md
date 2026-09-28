@@ -338,10 +338,11 @@ pushed after it arrives with a pre-baseline mtime, yet its hash still differs
 from the ancestor — a cloud change, not silence.
 
 `classify_unit` runs one content check (*which* files differ: `rclone check
---combined`) and one remote listing (`rclone lsf --format tp`: each cloud
-file's mtime), reads the current hash of the flagged files on each side
+--combined`), reads the current hash of the flagged files on each side
 (`rclone hashsum --files-from-raw` over only those — never the whole unit),
-then labels each differing file:
+and only where a hash is missing falls back to mtimes (below) — the one case
+that costs a cloud listing and a local `find`. It then labels each differing
+file:
 
 | `rclone check --combined` | changed here | changed there | class |
 |---|---|---|---|
@@ -405,9 +406,12 @@ captured *before* the transfer and installed only once it succeeds: taken
 afterwards they would enrol a file written during the transfer, which never
 crossed. The hashes come from the remote's metadata (`rclone hashsum`, which
 looks them up in parallel), never from local content: a `pull` reads them
-beside the listing that supplies the paths, and a `push` reads them *after*
+before its transfer, and a `push` reads them *after*
 the transfer — every pre-listed path then holds the pushed content on both
-sides, so no local file is ever hashed at sync time. The
+sides, so no local file is ever hashed at sync time. One `hashsum` pass is
+also the listing: it prints every file, a hashless one with a blank digest
+field, so membership needs no separate `lsf` (on a backend without hashes
+the manifest comes from `lsf` instead). The
 baseline is stamped at completion, because the sync's own writes land after the
 start — the marker, a restored `.git`, and, on a backend that cannot set a
 destination modtime, the transferred objects themselves — and would otherwise
@@ -428,8 +432,8 @@ any `remote` sets `<`, a `both` sets either half. So `<>` now means what it says
 and is rare enough to be worth blocking a transfer on (see
 [Transfer guard](#transfer-guard)).
 
-Cost is unchanged: the two one-way checks became one bidirectional check plus one
-listing. Two cases short-circuit before any comparison — an absent remote prefix
+Cost: one bidirectional check, plus hash lookups for the flagged files only;
+a cloud listing only when the mtime fallback is needed. Two cases short-circuit before any comparison — an absent remote prefix
 (nothing on the cloud: `>` if the unit holds files, else `=`) and a missing
 baseline (never synced from this machine: `<` if there is nothing local to lose,
 else `<>`, since direction is unknowable).

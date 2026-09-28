@@ -226,7 +226,7 @@ printf '\n== a v1 manifest (paths only) still attributes membership ==\n'
 # State written before hashes existed: edits fall back to mtimes, one-sided
 # attribution keeps working, and no re-baseline is forced.
 reset_tree; synced_unit o
-sed -E -i '1d; s/^[^ ]+ //' "$(state_of o)/manifest"
+downgrade_manifest o
 printf 'edited here\n' > "$WORK/o/doc.txt"
 check 'v1: local edit still local' '>' "$(symbol_of o)"
 check '  classified' 'local edit doc.txt' "$(detail_of o)"
@@ -330,5 +330,25 @@ printf 'edited there\n' > "$CLOUD/p/doc.txt"
 touch -d '2020-01-01' "$WORK/p/doc.txt" "$CLOUD/p/doc.txt"
 check 'old-mtime conflict: status' '<>' "$(symbol_of p)"
 check 'old-mtime conflict: prompt keeps it' '<>' "$(prompt_of p)"
+
+printf '\n== hashes settle drift without listing the cloud ==\n'
+# The rclone calls a verbose run makes, one line each.
+trace_of() { ferry -v "$@" 2>&1 >/dev/null | grep '^ferry: + rclone' ; }
+reset_tree; synced_unit h
+printf 'edited here\n' > "$WORK/h/doc.txt"
+trace=$(trace_of status h)
+check 'hash-backed edit is attributed' '>' "$(symbol_of h)"
+check '  with no cloud listing' '0' "$(grep -c ' lsf ' <<<"$trace")"
+downgrade_manifest h
+check 'without ancestor hashes the listing returns' '1' "$(trace_of status h | grep -c ' lsf ')"
+check '  and still attributes by mtime' '>' "$(symbol_of h)"
+
+printf '\n== a push records its manifest from one hashsum pass ==\n'
+reset_tree; ferry new m >/dev/null
+printf 'x\n' > "$WORK/m/doc.txt"
+trace=$(trace_of push m)
+check 'no cloud listing' '0' "$(grep -c ' lsf ' <<<"$trace")"
+check '  the manifest still holds the file and its hash' "$(md5sum "$CLOUD/m/doc.txt" | awk '{print $1}') doc.txt" \
+    "$(sed -n 2p "$(state_of m)/manifest")"
 
 report

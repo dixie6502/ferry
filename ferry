@@ -85,6 +85,7 @@ STATE_KEY=''
 # See remote_hash_type.
 HASH_PROBED=0
 HASH_TYPE=''
+HASH_WIDTH=0
 
 # Every verb, as "<name> <arguments> — <summary>": the one source for argument
 # and flag checks, help and completion. In <arguments>, `<x>` is required,
@@ -594,39 +595,61 @@ remote_hashes() {   # <hash type> <remote>
     rclone_quiet hashsum "$1" "${UNIT_EXCLUDE[@]}" "$2" | tally 'files hashed'
 }
 
-# Fill the named map with path → hash from `rclone hashsum` output (stdin). A
-# file the backend holds no hash for is printed with a blank hash and skipped;
-# a hash is bare hex, so its first double space always ends it.
+# Split one `rclone hashsum` line, "<digest>  <path>", into the caller's
+# line_hash / line_path. A digest is bare hex, so its first double space ends
+# it. rclone right-aligns the digest in a fixed-width field and leaves it blank
+# for an object the backend holds no hash for; that line is cut by the field's
+# width — never by stripping spaces, which a path may start with. The width is
+# learned once, from a local hash of empty input, when a blank line first needs it.
+split_hashsum_line() {   # <line>
+    local digest=${1%%  *}
+    case $digest in
+        ''|*[!0-9a-f]*) ;;
+        *) line_hash=$digest line_path=${1#*  }; return 0 ;;
+    esac
+    if [ "$HASH_WIDTH" = 0 ]; then
+        digest=$(printf '' | rclone_quiet hashsum "$HASH_TYPE" -) ||
+            { warn 'cannot learn the %s digest width from rclone' "$HASH_TYPE"; return 1; }
+        digest=${digest%%  *}
+        HASH_WIDTH=${#digest}
+    fi
+    line_hash='' line_path=${1:HASH_WIDTH+2}
+}
+
+# Fill the named map with path → hash from `rclone hashsum` output (stdin),
+# skipping objects without a digest (a blank field starts the line with a
+# space), so no field width is ever needed here.
 read_hashes() {   # <map name>
-    local -n into=$1; local line hash
+    local -n into=$1; local line line_hash line_path
     while IFS= read -r line; do
-        hash=${line%%  *}
-        case $hash in ''|*[!0-9a-f]*) continue ;; esac
-        into[${line#*  }]=$hash
+        case $line in ''|' '*) continue ;; esac
+        split_hashsum_line "$line"
+        # shellcheck disable=SC2004  # an associative map behind a nameref
+        [ -z "$line_hash" ] || into[$line_path]=$line_hash
     done
 }
 
 # One side of a unit, sorted, as manifest raw material. The local side is bare
-# paths; the remote side is "<hash> <path>" ancestor lines hashed with $3 (a
-# hash never holds a space, so the first space always ends it). The listing
-# decides membership: every listed path gets a line, its hash empty where the
-# backend holds none or $3 names no algorithm.
-# Returns non-zero if the side could not be listed.
-list_side() {   # <local|remote> <dir or remote> [<hash type>]
+# paths; the remote side is "<hash> <path>" lines hashed with HASH_TYPE, the
+# hash empty where none is known — from one `hashsum` pass when HASH_TYPE is
+# set, else from a listing. Returns non-zero if the side could not be listed.
+list_side() {   # <local|remote> <dir or remote>
     case "$1" in
         local)  load_ignore "$2"
                 find "$2" "${UNIT_PRUNE[@]}" -type f -printf '%P\n' | sort ;;
-        remote) local listing sums line p; local -A hashes=()
-                listing=$(remote_listing "$2") || return 1
-                if [ -n "${3:-}" ]; then
-                    sums=$(remote_hashes "$3" "$2") || return 1
-                    read_hashes hashes <<<"$sums"
-                fi
-                while IFS= read -r line; do
-                    [ -n "$line" ] || continue
-                    p=${line#*;}
-                    printf '%s %s\n' "${hashes[$p]:-}" "$p"
-                done <<<"$listing" | sort -t' ' -k2 ;;
+        remote) local output line line_hash line_path
+                if [ -n "$HASH_TYPE" ]; then
+                    output=$(remote_hashes "$HASH_TYPE" "$2") || return 1
+                    output=$(while IFS= read -r line; do
+                                 [ -n "$line" ] || continue
+                                 split_hashsum_line "$line" || exit 1
+                                 printf '%s %s\n' "$line_hash" "$line_path"
+                             done <<<"$output") || return 1
+                    sort -t' ' -k2 <<<"$output"
+                else
+                    output=$(remote_listing "$2") || return 1
+                    [ -z "$output" ] || sed 's/^[^;]*;/ /' <<<"$output" | sort -t' ' -k2
+                fi ;;
     esac
 }
 
@@ -771,39 +794,29 @@ classify_unit() {
         [ -n "$line" ] || continue
         flags+=("${line:0:1}"); paths+=("${line:2}"); flagged[${line:2}]=1
     done <<<"$report"
-    [ ${#paths[@]} -gt 0 ] || return 0    # nothing differs: no listing to consult
+    [ ${#paths[@]} -gt 0 ] || return 0    # nothing differs
     step "${#paths[@]} file(s) differ"
 
-    while IFS= read -r path; do local_moved[$path]=1; done < <(
-        find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$baseline" -printf '%P\n')
-
-    # The remote listing carries every cloud file's mtime (the fallback); only
-    # the flagged files are ever consulted, so only they are kept. Times compare
-    # as strings: 'max' is "Y-m-d H:M:S.ns" with trailing fraction zeros
-    # trimmed, which keeps lexicographic order chronological against the
-    # full-precision cutoff.
-    local cutoff listing
-    cutoff=$(TZ=UTC date '+%Y-%m-%d %H:%M:%S.%N' -r "$baseline")
-    listing=$(remote_listing "$remote_path") || return 1
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        path=${line#*;}
-        [ -n "${flagged[$path]:-}" ] || continue
-        [[ ${line%%;*} > $cutoff ]] && remote_moved[$path]=1
-    done <<<"$listing"
-
-    # Current hashes, the primary evidence: only flagged files with an ancestor
-    # hash (so a v2 manifest and its type), only on the side that decides the
-    # flag. A failed cloud lookup is trouble; a failed local one falls back to
-    # mtimes.
-    local -a local_needed=() remote_needed=()
+    # Which side decides each flag: both for a file on both sides, the
+    # surviving side for a one-sided file shared at the last sync (an unshared
+    # one is an add, whatever changed). The current hash is the primary
+    # evidence, read only where an ancestor hash exists to compare with; a
+    # deciding side left without one falls back to mtimes. A failed cloud
+    # lookup is trouble; a failed local one only means the fallback.
+    local -a local_deciding=() remote_deciding=() local_needed=() remote_needed=()
     for index in "${!paths[@]}"; do
-        [ -n "${ancestor[${paths[$index]}]:-}" ] || continue
+        path=${paths[$index]}
         case ${flags[$index]} in
-            '*') local_needed+=("${paths[$index]}"); remote_needed+=("${paths[$index]}") ;;
-            '+') local_needed+=("${paths[$index]}") ;;
-            '-') remote_needed+=("${paths[$index]}") ;;
+            '*') local_deciding+=("$path"); remote_deciding+=("$path") ;;
+            '+') [ -z "${synced[$path]:-}" ] || local_deciding+=("$path") ;;
+            '-') [ -z "${synced[$path]:-}" ] || remote_deciding+=("$path") ;;
         esac
+    done
+    for path in ${local_deciding[@]+"${local_deciding[@]}"}; do
+        [ -z "${ancestor[$path]:-}" ] || local_needed+=("$path")
+    done
+    for path in ${remote_deciding[@]+"${remote_deciding[@]}"}; do
+        [ -z "${ancestor[$path]:-}" ] || remote_needed+=("$path")
     done
     if [ ${#remote_needed[@]} -gt 0 ]; then
         step "reading ${#remote_needed[@]} cloud hash(es)"
@@ -814,6 +827,35 @@ classify_unit() {
     if [ ${#local_needed[@]} -gt 0 ]; then
         step "hashing ${#local_needed[@]} local file(s)"
         read_hashes local_hash < <(printf '%s\n' "${local_needed[@]}" | hash_paths "$manifest_type" "$dir")
+    fi
+
+    # The mtime fallback, for deciding sides still without a hash: a clean
+    # hash-backed unit needs neither a local walk nor a cloud listing.
+    local local_fallback=0 remote_fallback=0
+    for path in ${local_deciding[@]+"${local_deciding[@]}"}; do
+        [ -n "${local_hash[$path]:-}" ] || local_fallback=1
+    done
+    for path in ${remote_deciding[@]+"${remote_deciding[@]}"}; do
+        [ -n "${remote_hash[$path]:-}" ] || remote_fallback=1
+    done
+    if [ "$local_fallback" = 1 ]; then
+        while IFS= read -r path; do local_moved[$path]=1; done < <(
+            find "$dir" "${UNIT_PRUNE[@]}" -type f -newer "$baseline" -printf '%P\n')
+    fi
+    if [ "$remote_fallback" = 1 ]; then
+        # Only the flagged files are consulted, so only they are kept. Times
+        # compare as strings: 'max' is "Y-m-d H:M:S.ns" with trailing fraction
+        # zeros trimmed, which keeps lexicographic order chronological against
+        # the full-precision cutoff.
+        local cutoff listing
+        cutoff=$(TZ=UTC date '+%Y-%m-%d %H:%M:%S.%N' -r "$baseline")
+        listing=$(remote_listing "$remote_path") || return 1
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            path=${line#*;}
+            [ -n "${flagged[$path]:-}" ] || continue
+            [[ ${line%%;*} > $cutoff ]] && remote_moved[$path]=1
+        done <<<"$listing"
     fi
 
     for index in "${!paths[@]}"; do
@@ -1081,7 +1123,7 @@ fetch_unit() {
     # included — is the set the two sides will share. A listing that fails must
     # fail the transfer, not quietly record an empty ancestor set.
     remote_hash_type || return 1
-    manifest=$(list_side remote "$remote_path" "$HASH_TYPE") || return 1
+    manifest=$(list_side remote "$remote_path") || return 1
     mkdir -p "$dir" || return 1
     transfer "$remote_path" "$dir" || return 1
     claim_unit "$dir" || return 1
@@ -1121,7 +1163,7 @@ record_sync_point() {   # <remote> <spec> <shared paths> [<conflicted path>...]
     remote_hash_type || return 1
     local body='' line path
     if [ -n "$shared" ]; then
-        body=$(list_side remote "$remote_path" "$HASH_TYPE") || return 1
+        body=$(list_side remote "$remote_path") || return 1
         body=$(intersect_manifest "$shared" "$body")
     fi
     if [ $# -gt 0 ]; then
