@@ -37,6 +37,10 @@ state_of() {
 # Every cloud file of a unit, one space-joined line.
 cloud_of() { rclone lsf -R --files-only "$CLOUD/$1" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '; }
 
+# The exit status and first stderr line of a run expected to fail, as
+# "<status>|<line>".
+failure_of() { local out rc=0; out=$(ferry "$@" 2>&1 >/dev/null) || rc=$?; printf '%s|%s' "$rc" "${out%%$'\n'*}"; }
+
 check() {
     local label=$1 want=$2 got=$3
     if [ "$want" = "$got" ]; then

@@ -15,9 +15,6 @@ SUITE_TMP=tsf
 # shellcheck source=tests/common.sh
 source "$(dirname "$0")/common.sh"
 
-# The exit status and stderr of a run expected to fail, as "<status>|<stderr>".
-failure_of() { local out rc=0; out=$(ferry "$@" 2>&1 >/dev/null) || rc=$?; printf '%s|%s' "$rc" "$out"; }
-
 yes_no() { if "$@"; then echo yes; else echo no; fi; }
 
 printf '\n== the tree root is never a unit ==\n'

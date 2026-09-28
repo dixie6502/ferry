@@ -19,23 +19,10 @@
 # (rules for every unit) and one per unit, both read relative to the unit. What
 # is ignored is excluded from transfers AND from drift, so the two never disagree.
 #
-#   ferry init <base>     make $PWD a root holding <base>   (no nested roots)
-#   ferry list [<dir>]    remote children of a node (no local dir needed)
-#   ferry status [<dir>]  drift for every unit at/under $PWD
-#   ferry resolve [<dir>] stage the cloud side of a conflict, to compare by hand
-#   ferry sync [<dir>]    converge a unit both ways (additive; conflicts stay put)
-#   ferry pull [<dir>]    materialize a unit; no arg → every unit under $PWD
-#   ferry push [<dir>]    send a unit up; no arg → every unit under $PWD
-#   ferry new  <name>     start a BRAND-NEW unit (cloud prefix on first push)
-#   ferry mv <old> <new>  rename/move a unit or grouping dir (cloud first, then local)
-#   ferry drop [<dir>]    delete LOCAL only; the cloud keeps its copy
-#   ferry rm   <dir>      delete a unit BOTH sides (confirmation-gated)
-#   ferry completion bash emit a bash completion script (eval from your shell rc)
-#
-# Flags: --mirror (propagate deletions; push/pull, single <dir> only), --force
-# (skip the pre-transfer drift guard; push/pull), -y/--yes (skip prompts),
-# -v/--verbose (trace every rclone call and pass it -v).
-# sync takes neither: it has no direction to delete on or to prefer.
+# Flags: --mirror (propagate deletions; single <dir> only), --force (skip the
+# pre-transfer drift guard), -y/--yes (skip prompts), -v/--verbose (trace every
+# rclone call and pass it -v). The list below shows which verb takes which.
+# Flags may come anywhere; `--` ends them.
 #
 # Requires: bash, rclone (with the remote configured), git.
 
@@ -78,14 +65,38 @@ IGNORE_LOADED=''
 DRIFT=''
 DRIFT_FILES=''
 
+# Every verb, as "<name> <arguments> — <summary>": the one source for argument
+# and flag checks, help and completion. In <arguments>, `<x>` is required,
+# `[<x>]` optional, a bare word literal, and `[-f|--flag]` a flag the verb
+# takes; COMMON_FLAGS go with every verb. ($PWD is text here, not expanded.)
+# shellcheck disable=SC2016
+readonly VERBS=(
+    'init <remote:path> — make $PWD a root holding <remote:path> (no nested roots)'
+    'list [<dir>] — remote children of a node (no local dir needed)'
+    'status [<dir>] — drift for every unit at/under <dir> or $PWD'
+    'resolve [<dir>] — stage the cloud side of a conflict, to compare by hand'
+    'sync [<dir>] — converge a unit both ways (additive; conflicts stay put)'
+    'pull [--mirror] [--force] [<dir>] — materialize a unit; no <dir> → every unit under $PWD'
+    'push [--mirror] [--force] [<dir>] — send a unit up; no <dir> → every unit under $PWD'
+    'new <name> — start a BRAND-NEW unit (cloud prefix on first push)'
+    'mv <old> <new> — rename/move a unit or grouping dir (cloud first, then local)'
+    'drop [-y|--yes] [<dir>] — delete LOCAL only; the cloud keeps its copy'
+    'rm [-y|--yes] <dir> — delete a unit BOTH sides (confirmation-gated)'
+    'completion bash — emit a bash completion script (eval from your shell rc)'
+    'help — this help'
+)
+readonly COMMON_FLAGS='-v --verbose -h --help'
+
 # --mirror: propagate deletions (single-unit push/pull only).
 # --force: skip the pre-transfer drift guard (and the probe it costs).
+# --yes: skip confirmation prompts.
 MIRROR=0
 FORCE=0
+YES=0
 
 # --verbose: echo each rclone command and let rclone log at INFO.
-# STEPS: announce each phase of a unit's run (set for the transferring verbs
-# and by --verbose), so a slow cloud reads as slow, not as hung.
+# STEPS: announce each phase of a unit's run (set by run_units, resolve and
+# --verbose), so a slow cloud reads as slow, not as hung.
 VERBOSE=0
 STEPS=0
 
@@ -186,12 +197,13 @@ validate_name() {
     esac
 }
 
-# Prompt for confirmation unless -y was given; abort on anything but yes.
+# Prompt for confirmation unless -y was given; abort on anything but yes,
+# end of input included. The prompt goes to stderr, visible when stdout is not.
 confirm() {
-    local yes=$1 msg=$2 reply
-    [ "$yes" = 1 ] && return 0
-    printf '%s [y/N] ' "$msg"
-    read -r reply
+    local reply=''
+    [ "$YES" = 1 ] && return 0
+    printf '%s [y/N] ' "$1" >&2
+    read -r reply || true
     case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) die "aborted" ;; esac
 }
 
@@ -1193,7 +1205,7 @@ sync_unit() {
 # condition would switch errexit off for its whole body, so a failure the code
 # does not check by hand would pass as success; here it fails the unit, and so
 # does a `die` — never the rest of the batch. The subshell also forgets what a
-# unit memoized, which is why main settles the hash type before any batch.
+# unit memoized, which is why run_units settles the hash type before a batch.
 run_batch() {
     local op=$1; shift
     local n=$# i=0 ok=0 dir spec status; local -a failed=()
@@ -1213,13 +1225,25 @@ run_batch() {
     printf '%s: %d/%d ok\n' "$PROG" "$ok" "$n"
 }
 
-# The no-arg walk: run a per-unit op over every unit under $PWD. Never
-# mirrors — deletion-propagation is a single-unit-only opt-in.
-walk_units() {
-    local op=$1 here; here=$(pwd -P)
-    local -a list; mapfile -t list < <(units_under "$here")
-    [ ${#list[@]} -gt 0 ] || { printf '%s: no units under %s\n' "$PROG" "$here"; return 0; }
-    run_batch "$op" "${list[@]}"
+# Run a per-unit op on the unit <dir> names (as <resolver> finds it), or else
+# on every unit under $PWD. A walk never mirrors: deletion-propagation is a
+# single-unit-only opt-in.
+#
+# Every phase is announced (see STEPS), and the hash type — fixed for the run —
+# is probed once here, before run_batch's per-unit subshells would each forget
+# it; a dead cloud fails fast.
+run_units() {   # <op> <resolver> [<dir>]
+    local op=$1 resolver=$2 target here; local -a units
+    if [ -n "${3:-}" ]; then
+        target=$("$resolver" "$3"); units=("$target")
+    else
+        [ "$MIRROR" = 0 ] || die "--mirror applies to a single <dir> only"
+        here=$(pwd -P); mapfile -t units < <(units_under "$here")
+        [ ${#units[@]} -gt 0 ] || { printf '%s: no units under %s\n' "$PROG" "$here"; return 0; }
+    fi
+    STEPS=1
+    remote_hash_type || die "cannot read the cloud at $BASE"
+    run_batch "$op" "${units[@]}"
 }
 
 # Resolve a verb's target to the unit it acts on: the argument if given, else the
@@ -1234,8 +1258,7 @@ unit_target() {
 
 # --- verbs ------------------------------------------------------------------
 cmd_init() {
-    local base=${1:-}
-    [ -n "$base" ] || die "usage: $PROG init <remote:path>"
+    local base=$1
     case "$base" in *:*) ;; *) die "base must look like 'remote:path', got '$base'" ;; esac
     in_tree && die "already inside a tree rooted at $ROOT"
     [ -e "$PWD/$MARKER" ] && die "$MARKER already exists here"
@@ -1274,6 +1297,7 @@ cmd_status() {
 # unit's state dir: outside the tree, so it is never transferred, and `drop`/`rm`
 # already take it away with the unit.
 cmd_resolve() {
+    STEPS=1
     local target; target=$(unit_target "${1:-}")
     local spec rp stage line; spec=$(spec_of "$target"); rp=$(remote_of "$target")
     stage=$(state_path "$spec")/conflict
@@ -1362,8 +1386,7 @@ cmd_resolve() {
 # unrepresentable on object stores, and a never-pushed unit reads correctly anyway
 # (status: '=' empty, '>' once it holds files). Refused if the cloud path exists.
 cmd_new() {
-    local name=${1:-}; [ -n "$name" ] || die "usage: $PROG new <name>"
-    local target; target=$(resolve_target "$name")
+    local target; target=$(resolve_target "$1")
     refuse_in_unit "$target"
     [ -e "$target" ] && die "already exists: $target"
     local rstate=0; remote_state "$(remote_of "$target")" || rstate=$?
@@ -1376,46 +1399,19 @@ cmd_new() {
 }
 
 # The daily verb: direction comes from the classification, not from the user.
-# The flags stay with the directional verbs — --mirror needs a side to delete
-# on, --force a side to prefer — so sync takes neither.
-cmd_sync() {
-    local arg=${1:-}
-    [ "$MIRROR" = 1 ] && die "sync converges both sides; deletions propagate via 'push --mirror'/'pull --mirror'"
-    [ "$FORCE" = 1 ] && die "sync has no --force; choose a side with 'push --force' or 'pull --force'"
-    if [ -n "$arg" ]; then
-        local target; target=$(unit_target "$arg")
-        run_batch sync_unit "$target"
-        return
-    fi
-    walk_units sync_unit
-}
+cmd_sync() { run_units sync_unit unit_target "${1:-}"; }
+cmd_pull() { run_units pull_unit transfer_target "${1:-}"; }
+cmd_push() { run_units push_unit push_target "${1:-}"; }
 
-cmd_pull() {
-    local arg=${1:-}
-    if [ -n "$arg" ]; then
-        local target; target=$(transfer_target "$arg")
-        run_batch pull_unit "$target"
-        return
-    fi
-    [ "$MIRROR" = 1 ] && die "--mirror applies to a single <dir> only"
-    walk_units pull_unit
-}
-
-cmd_push() {
-    local arg=${1:-}
-    if [ -n "$arg" ]; then
-        local target; target=$(transfer_target "$arg")
-        [ -d "$target" ] || die "no local dir: $target"
-        run_batch push_unit "$target"
-        return
-    fi
-    [ "$MIRROR" = 1 ] && die "--mirror applies to a single <dir> only"
-    walk_units push_unit
+# A push's unit must exist here: checked before anything reaches the cloud.
+push_target() {
+    local target; target=$(transfer_target "$1")
+    [ -d "$target" ] || die "no local dir: $(spec_of "$target")"
+    printf '%s' "$target"
 }
 
 cmd_drop() {
-    local yes=$1 arg=${2:-}
-    local target; target=$(unit_target "$arg")
+    local target; target=$(unit_target "${1:-}")
     refuse_cwd_inside "$target"
     local spec; spec=$(spec_of "$target")
     probe_unit "$target"        # the same classifier status uses: direction matters here
@@ -1423,7 +1419,7 @@ cmd_drop() {
         *'>'*) printf '%s: WARNING — local has changes not on the cloud (unpushed).\n' "$PROG" >&2 ;;
         '?')   printf '%s: WARNING — could not read the cloud to check for unpushed changes.\n' "$PROG" >&2 ;;
     esac
-    confirm "$yes" "Delete local $target? (cloud keeps its copy)"
+    confirm "Delete local $target? (cloud keeps its copy)"
     rm -rf "$target"
     rm -rf "$(state_path "$spec")"
     printf '%s: dropped %s (cloud retains it)\n' "$PROG" "$spec"
@@ -1432,16 +1428,14 @@ cmd_drop() {
 # Delete a unit on BOTH sides. Restricted to a local unit: cloud-only paths are
 # out of scope (use rclone directly), and a grouping dir is never purged wholesale.
 cmd_rm() {
-    local yes=$1 arg=${2:-}
-    [ -n "$arg" ] || die "usage: $PROG rm <dir>"
-    local target; target=$(unit_target "$arg")
+    local target; target=$(unit_target "$1")
     refuse_cwd_inside "$target"
     local rp spec rstate=0; rp=$(remote_of "$target"); spec=$(spec_of "$target")
     remote_state "$rp" || rstate=$?
     # Deleting only the local copy while reporting "both sides" would be a lie
     # that also loses the one copy we could still see.
     [ "$rstate" = 2 ] && die "cannot reach the cloud for $spec — refusing to delete the local copy alone"
-    confirm "$yes" "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"
+    confirm "DELETE BOTH local and cloud for '$spec'? (recovery depends on the remote's trash/versioning)"
     [ "$rstate" = 0 ] && run_rclone purge "$rp"
     [ -e "$target" ] && rm -rf "$target"
     rm -rf "$(state_path "$spec")"
@@ -1456,8 +1450,7 @@ cmd_rm() {
 # cloud directory merges into it, overwriting same-named files. A source the
 # cloud does not hold (a unit never pushed) moves locally only.
 cmd_mv() {
-    local old=${1:-} new=${2:-}
-    { [ -n "$old" ] && [ -n "$new" ]; } || die "usage: $PROG mv <old> <new>"
+    local old=$1 new=$2
     local old_abs new_abs; old_abs=$(resolve_target "$old"); new_abs=$(resolve_target "$new")
     local old_spec new_spec; old_spec=$(spec_of "$old_abs"); new_spec=$(spec_of "$new_abs")
     [ "$old_abs" != "$ROOT" ] || die "the tree root cannot be moved"
@@ -1496,106 +1489,167 @@ cmd_mv() {
     if [ -d "$so" ]; then rm -rf "$sn"; mkdir -p "$(dirname "$sn")"; mv "$so" "$sn"; fi
 }
 
+# Split a VERBS entry into the caller's verb_name / verb_spec / verb_summary.
+split_verb() {
+    local head=${1%% — *}
+    verb_summary=${1#* — }
+    verb_name=${head%% *}
+    verb_spec=${head#"$verb_name"}; verb_spec=${verb_spec# }
+}
+
+# Read a VERBS argument spec into the caller's spec_min / spec_max (how many
+# positional arguments), spec_flags (flags beyond COMMON_FLAGS, space-separated)
+# and spec_complete (what a positional completes to: 'dir', literal words, or
+# nothing). An argument `<x>` is a local path unless its name holds ':'.
+parse_spec() {
+    local word; local -a words
+    spec_min=0 spec_max=0 spec_flags='' spec_complete=''
+    read -ra words <<<"$1"
+    for word in ${words[@]+"${words[@]}"}; do
+        case $word in
+            '[-'*) word=${word#[}; word=${word%]}
+                   spec_flags+="${spec_flags:+ }${word//|/ }"; continue ;;
+            '['*)  spec_max=$((spec_max + 1)) ;;
+            *)     spec_min=$((spec_min + 1)) spec_max=$((spec_max + 1)) ;;
+        esac
+        word=${word#[}; word=${word%]}
+        case $word in
+            '<'*:*'>') ;;
+            '<'*)      spec_complete=dir ;;
+            *)         spec_complete+="${spec_complete:+ }$word" ;;
+        esac
+    done
+}
+
+# Die unless <verb> is in VERBS and takes these flags and this many positional
+# arguments, as its entry spells them.
+check_invocation() {   # <verb> <positional count> [<flag>...]
+    local verb=$1 count=$2 entry flag usage accepted
+    local verb_name='' verb_spec verb_summary spec_min spec_max spec_flags spec_complete
+    shift 2
+    for entry in "${VERBS[@]}"; do
+        split_verb "$entry"
+        [ "$verb_name" != "$verb" ] || break
+    done
+    [ "$verb_name" = "$verb" ] || die "unknown command: $verb (try: $PROG help)"
+    parse_spec "$verb_spec"
+    usage="usage: $PROG $verb${verb_spec:+ $verb_spec}"
+    accepted=" $COMMON_FLAGS $spec_flags "
+    for flag in "$@"; do
+        [[ $accepted == *" $flag "* ]] || die "$verb does not take $flag ($usage)"
+    done
+    [ "$count" -ge "$spec_min" ] && [ "$count" -le "$spec_max" ] || die "$usage"
+}
+
 # Emit a bash completion script for ferry; install with `eval "$(ferry completion bash)"`.
 # Only bash is supported. The prompt indicator stays a separately-sourced file
-# (ferry-prompt.sh), like git's git-prompt.sh vs git-completion.bash.
+# (ferry-prompt.sh), like git's git-prompt.sh vs git-completion.bash. Verbs and
+# their arguments come from VERBS, so completion offers what main accepts.
 cmd_completion() {
-    local shell=${1:-}
-    case "$shell" in
-        bash) ;;
-        '')   die "usage: $PROG completion bash" ;;
-        *)    die "unsupported shell '$shell' (only bash)" ;;
-    esac
+    [ "$1" = bash ] || die "unsupported shell '$1' (only bash)"
+    local entry verbs='' verb_name verb_spec verb_summary spec_min spec_max spec_flags spec_complete
+    printf '# bash completion for ferry — verbs, verb-specific flags, directory arguments.\n'
+    printf '# Plain bash 3.2: no associative arrays, no mapfile.\n'
+    printf '# shellcheck disable=SC2207\n'
+    # _ferry_of <flags|args> <verb>: a verb's flags, or what its positional
+    # arguments complete to ('dir', literal words, or nothing).
+    # shellcheck disable=SC2016
+    printf '_ferry_of() {\n    case $1:$2 in\n'
+    for entry in "${VERBS[@]}"; do
+        split_verb "$entry"
+        parse_spec "$verb_spec"
+        verbs+=" $verb_name"
+        printf '        flags:%s) printf %%s %q ;;\n' "$verb_name" "$COMMON_FLAGS${spec_flags:+ $spec_flags}"
+        printf '        args:%s) printf %%s %q ;;\n' "$verb_name" "$spec_complete"
+    done
+    printf '        flags:*) printf %%s %q ;;\n' "$COMMON_FLAGS"
+    printf '    esac\n}\n'
+    printf '_ferry_verbs=%q\n' "${verbs# }"
     cat <<'COMPLETION'
-# bash completion for ferry — verbs, verb-specific flags, directory arguments.
 _ferry() {
-    local cur verb flags
-    cur=${COMP_WORDS[COMP_CWORD]}
-
-    # The verb itself.
-    if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W 'init list status resolve sync pull push new mv drop rm completion help' -- "$cur") )
-        return
-    fi
-    verb=${COMP_WORDS[1]}
-
-    # Flags, offered only for the verbs that accept them.
-    if [ "${cur:0:1}" = - ]; then
-        flags='-h --help -v --verbose'
-        case $verb in
-            pull|push) flags="$flags --mirror --force" ;;
-            drop|rm)   flags="$flags -y --yes" ;;
+    local cur=${COMP_WORDS[COMP_CWORD]} verb='' word i only_words=0
+    # The verb is the first word that is not a flag, as main reads it; a `--`
+    # anywhere before the cursor makes the rest words.
+    for (( i = 1; i < COMP_CWORD; i++ )); do
+        word=${COMP_WORDS[i]}
+        if [ "$only_words" = 0 ] && [ "$word" = -- ]; then only_words=1
+        elif [ -z "$verb" ] && { [ "$only_words" = 1 ] || [ "${word:0:1}" != - ]; }; then verb=$word
+        fi
+    done
+    COMPREPLY=()
+    if [ "$only_words" = 0 ] && [ "${cur:0:1}" = - ]; then
+        COMPREPLY=( $(compgen -W "$(_ferry_of flags "$verb")" -- "$cur") )
+    elif [ -z "$verb" ]; then
+        COMPREPLY=( $(compgen -W "$_ferry_verbs" -- "$cur") )
+    else
+        case $(_ferry_of args "$verb") in
+            '')  ;;
+            dir) if declare -F _filedir >/dev/null 2>&1; then _filedir -d
+                 else COMPREPLY=( $(compgen -d -- "$cur") ); fi ;;
+            *)   COMPREPLY=( $(compgen -W "$(_ferry_of args "$verb")" -- "$cur") ) ;;
         esac
-        COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
-        return
     fi
-
-    # Positional argument: a shell for `completion`, a directory for the rest.
-    case $verb in
-        completion) COMPREPLY=( $(compgen -W 'bash' -- "$cur") ) ;;
-        list|status|resolve|sync|pull|push|new|mv|drop|rm)
-            if declare -F _filedir >/dev/null 2>&1; then _filedir -d
-            else COMPREPLY=( $(compgen -d -- "$cur") ); fi ;;
-    esac
 }
 complete -F _ferry ferry
 COMPLETION
 }
 
+cmd_help() { usage 0; }
+
+# Print the header comment's prose and the VERBS table, then exit with $1 —
+# on stderr when it is non-zero (a usage error).
 usage() {
-    awk 'NR<3{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
-    exit "${1:-0}"
+    local status=${1:-0} entry verb_name verb_spec verb_summary
+    {
+        awk 'NR<3{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+        printf '\nCommands:\n'
+        for entry in "${VERBS[@]}"; do
+            split_verb "$entry"
+            printf '  %s %-38s %s\n' "$PROG" "$verb_name${verb_spec:+ $verb_spec}" "$verb_summary"
+        done
+    } >&"$(( status == 0 ? 1 : 2 ))"
+    exit "$status"
 }
 
 # --- dispatch ---------------------------------------------------------------
+# Words and flags may interleave; the first word is the verb, and `--` makes
+# everything after it a word (a <dir> that starts with '-').
 main() {
-    [ $# -ge 1 ] || usage 1
-
-    local verb=$1; shift
-    local yes=0; local -a args=()
-    for a in "$@"; do
-        case "$a" in
-            --mirror) MIRROR=1 ;;
-            --force)  FORCE=1 ;;
-            -y|--yes) yes=1 ;;
-            -v|--verbose) VERBOSE=1 STEPS=1 ;;
-            -*)       die "unknown flag: $a" ;;
-            *)        args+=("$a") ;;
+    local arg verb only_words=0; local -a words=() flags=()
+    for arg in "$@"; do
+        if [ "$only_words" = 1 ]; then words+=("$arg"); continue; fi
+        case $arg in
+            --)  only_words=1 ;;
+            -?*) flags+=("$arg") ;;
+            *)   words+=("$arg") ;;
         esac
     done
-    set -- "${args[@]+"${args[@]}"}"
+    # A help flag wins over everything else on the line, as with most tools.
+    case " ${flags[*]-} " in *' -h '*|*' --help '*) usage 0 ;; esac
+    [ ${#words[@]} -gt 0 ] || usage 1
+    # An empty argument (an unset "$var") must not quietly mean $PWD.
+    for arg in "${words[@]}"; do [ -n "$arg" ] || die "empty argument"; done
+    verb=${words[0]}; words=("${words[@]:1}")
+    check_invocation "$verb" "${#words[@]}" ${flags[@]+"${flags[@]}"}
+    for arg in ${flags[@]+"${flags[@]}"}; do
+        case $arg in
+            --mirror)     MIRROR=1 ;;
+            --force)      FORCE=1 ;;
+            -y|--yes)     YES=1 ;;
+            -v|--verbose) VERBOSE=1 STEPS=1 ;;
+        esac
+    done
 
     exec {LOG_FD}>&2
-    case "$verb" in sync|pull|push|resolve) STEPS=1 ;; esac
     [ "$VERBOSE" = 0 ] || export RCLONE_VERBOSE=1
 
-    # init and completion need neither rclone nor an enclosing tree; the rest do.
+    # init, completion and help need neither rclone nor an enclosing tree.
     case "$verb" in
-        init|completion|help|-h|--help) ;;
+        init|completion|help) ;;
         *) require rclone; find_root ;;
     esac
-    # The hash type is fixed for the run: probed once here, before run_batch's
-    # per-unit subshells, so no unit re-probes it and a dead cloud fails fast.
-    case "$verb" in
-        sync|pull|push) remote_hash_type || die "cannot read the cloud at $BASE" ;;
-    esac
 
-    case "$verb" in
-        init)   cmd_init "${1:-}" ;;
-        list)   cmd_list "${1:-}" ;;
-        status) cmd_status "${1:-}" ;;
-        resolve) cmd_resolve "${1:-}" ;;
-        sync)   cmd_sync "${1:-}" ;;
-        new)    cmd_new "${1:-}" ;;
-        pull)   cmd_pull "${1:-}" ;;
-        push)   cmd_push "${1:-}" ;;
-        drop)   cmd_drop "$yes" "${1:-}" ;;
-        rm)     cmd_rm "$yes" "${1:-}" ;;
-        mv)     cmd_mv "${1:-}" "${2:-}" ;;
-        completion) cmd_completion "${1:-}" ;;
-        -h|--help|help) usage 0 ;;
-        *)      die "unknown command: $verb (try: $PROG help)" ;;
-    esac
+    "cmd_$verb" ${words[@]+"${words[@]}"}
 }
 
 # Run only when executed directly, so tests can source the helpers in isolation.

@@ -53,22 +53,25 @@ ferry init Remote:Projects   # writes ~/Projects/.ferry
 ## Usage
 
 ```
-ferry init <base>       make $PWD a root holding <base> (no nested roots)
-ferry list  [<dir>]     list a node's children on the remote (no local dir needed)
-ferry status [<dir>]    drift for every unit at/under $PWD (the "fetch")
-ferry resolve [<dir>]   stage the cloud side of a conflict, to compare by hand
-ferry sync  [<dir>]     converge a unit both ways; no arg → every unit under $PWD
-ferry pull  [<dir>]     materialize a unit; no arg → every unit under $PWD
-ferry push  [<dir>]     send a unit up;     no arg → every unit under $PWD
-ferry new   <name>      start a brand-new unit (cloud prefix appears on first push)
-ferry mv    <old> <new> rename/move a unit or grouping dir (cloud, then local)
-ferry drop  [<dir>]     delete a unit locally; the cloud keeps everything
-ferry rm    <dir>       delete a unit BOTH sides (confirmation-gated)
+  ferry init <remote:path>                     make $PWD a root holding <remote:path> (no nested roots)
+  ferry list [<dir>]                           remote children of a node (no local dir needed)
+  ferry status [<dir>]                         drift for every unit at/under <dir> or $PWD
+  ferry resolve [<dir>]                        stage the cloud side of a conflict, to compare by hand
+  ferry sync [<dir>]                           converge a unit both ways (additive; conflicts stay put)
+  ferry pull [--mirror] [--force] [<dir>]      materialize a unit; no <dir> → every unit under $PWD
+  ferry push [--mirror] [--force] [<dir>]      send a unit up; no <dir> → every unit under $PWD
+  ferry new <name>                             start a BRAND-NEW unit (cloud prefix on first push)
+  ferry mv <old> <new>                         rename/move a unit or grouping dir (cloud first, then local)
+  ferry drop [-y|--yes] [<dir>]                delete LOCAL only; the cloud keeps its copy
+  ferry rm [-y|--yes] <dir>                    delete a unit BOTH sides (confirmation-gated)
+  ferry completion bash                        emit a bash completion script (eval from your shell rc)
+  ferry help                                   this help
 ```
 
-Most verbs take an optional `<dir>` (relative to `$PWD`); omitted, they act on
-`$PWD`. The whole model is two walks: **up** to the root for the base, **down**
-to the unit leaves for what to transfer.
+This is `ferry help`'s list (a test keeps the two in step). Most verbs take an
+optional `<dir>` (relative to `$PWD`); omitted, they act on `$PWD`. The whole
+model is two walks: **up** to the root for the base, **down** to the unit
+leaves for what to transfer.
 
 ### Browse, create & delete
 
@@ -175,8 +178,12 @@ continues (additive copy is idempotent, so re-running resumes), ending with an
   default (`rclone copy`). **Single `<dir>` only** — refused on a walk, where an
   interrupted deletion-sync is unsafe.
 - `--force` — skip the drift guard below (and the probe it costs).
-- `-y` — skip confirmation prompts (`drop`, `rm`).
+- `-y` / `--yes` — skip confirmation prompts.
 - `-v` / `--verbose` — echo every rclone command and run it with `-v`.
+
+Each verb takes only the flags and the number of arguments its line in
+`ferry help` shows; anything else is refused, never ignored. Flags may come
+anywhere on the line, and `--` ends them (for a `<dir>` starting with `-`).
 
 `sync`/`pull`/`push`/`resolve` always announce each phase (comparing, listing,
 hashing, uploading…) on stderr, and a failed rclone call prints its own error
