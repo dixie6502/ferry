@@ -2,7 +2,7 @@
 
 On-demand, **sparse** sync of a remote tree to/from local disk via
 [rclone](https://rclone.org) — **backend-agnostic**: any rclone remote, whether
-filesystem-style (Filen, SFTP) or an object store (S3, GCS). A single place for
+filesystem-style (SFTP, WebDAV) or an object store (S3, GCS). A single place for
 in-progress work that lives **outside GitHub** — no collaboration, sensitive
 data, large files welcome, version control optional.
 

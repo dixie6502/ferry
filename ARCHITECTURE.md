@@ -182,7 +182,7 @@ cloud, since `push` is additive.
 ## Backend agnosticism
 
 ferry runs unchanged on two structurally different remote families — **filesystem-style**
-(Filen, SFTP, local, WebDAV: real directories, cheap rename, can hold empty dirs)
+(SFTP, local, WebDAV: real directories, cheap rename, can hold empty dirs)
 and **object stores** (S3, GCS, B2, R2: a flat key space, "directories" are just
 key prefixes, no empty dirs, no native rename). It does so **without any
 backend-type branch** in the code. Two design choices make that possible:
@@ -221,8 +221,8 @@ because it detects the backend and adapts. Adding such a branch would be the wro
 move; the genericity is a property of the model, not of special-casing.
 
 **Hashes can cost a request each.** A backend may leave a file's hash out of a
-directory listing and look it up per file when asked — Filen does, and a file
-uploaded there without rclone has no hash to find at all. Two generic rules keep
+directory listing and look it up per file when asked, and a file uploaded there
+without rclone may have no hash to find at all. Two generic rules keep
 that off the critical path, with no backend branch: every call runs with
 `--fast-list` (one recursive listing, which does carry hashes, where the backend
 has one; rclone otherwise lists per directory whenever a directory exclusion such
@@ -330,7 +330,7 @@ Direction is therefore taken **relative to the last sync** — the role git's
 merge base plays. The manifest records that sync's ancestors: every path the
 two sides shared, with its content hash at that moment (`#ferry v2 <hashtype>`
 header, then `<hash> <path>` lines, hashed with the remote's preferred
-algorithm as rclone reports it — blake3 on Filen, md5 on Drive or S3-alikes).
+algorithm as rclone reports it — e.g. md5 on Drive or S3-alikes).
 A side changed a file iff its current hash differs from the recorded ancestor.
 Mtimes carry no weight here, which makes the attribution immune to the lies
 transfers preserve: a file edited on another machine before our baseline and

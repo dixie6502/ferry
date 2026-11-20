@@ -165,9 +165,9 @@ tally() {   # <what one line is, e.g. "files listed">
 # (main exports RCLONE_VERBOSE for rclone's own logging).
 #
 # --fast-list: one recursive listing instead of one per directory. Beyond
-# fewer requests, it is what carries hashes on Filen: its per-directory listing
-# omits them, so every hash a check, listing or --checksum transfer reads costs
-# a lookup per file (7416 files: 6s with it, many minutes without). Without
+# fewer requests, it is what carries hashes on backends whose per-directory
+# listing omits them; without it every hash a check, listing or --checksum
+# transfer reads costs a lookup per file (7416 files: 6s with it, many minutes without). Without
 # the flag, rclone lists per directory whenever a directory exclusion is in
 # play — and UNIT_EXCLUDE always holds '.git/**'. Backends without a recursive
 # listing ignore it. A user's RCLONE_FAST_LIST is left to rule, as flags
@@ -573,8 +573,8 @@ record_remote_bit() { printf '%s %s\n' "$2" "$(date +%s)" > "$1/$REMOTE_BIT"; }
 # Returns non-zero if the listing failed.
 # Times are rendered in UTC: local-time strings go backwards across a DST
 # fall-back, and the baseline cutoff compares them lexicographically.
-# No hashes here: a backend may look each one up with its own request (Filen
-# does, for a file uploaded without one — and still finds none), and a listing
+# No hashes here: a backend may look each one up with its own request (and
+# may still find none for a file uploaded without rclone), and a listing
 # makes those requests one at a time. Hashes come from hash_paths/remote_hashes.
 remote_listing() {   # <remote>
     step 'listing the cloud'
