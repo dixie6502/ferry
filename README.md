@@ -364,7 +364,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
 ```sh
 tests/run              # every suite
-tests/run drift        # one of: drift | guard | resolve | sync | ignore
+tests/run drift        # one of: drift | guard | resolve | sync | ignore | safety | cli
 ```
 
 They drive the real `ferry` script against a **real rclone backend** — the cloud
@@ -380,6 +380,8 @@ from them. Scratch trees are built under `tmp/` and reset by each suite.
 | `resolve` | staging the cloud's side, the git merge-base hint, stale staging, filenames rclone would otherwise drop |
 | `sync` | both directions in one run, deletions restored (union), conflicts left in place and still resolvable, walks |
 | `ignore` | `.ferryignore` on both sides: unit and tree-root rules, anchoring, `sync` and `--mirror` safety, refused patterns, prompt agreement |
+| `safety` | refusals that protect the tree, cloud and state: root and grouping nodes are never units, `mv` never merges, state keys, root marker parsing, one unit failing alone, git history |
+| `cli` | argument counts, per-verb flags, `--`, help and README in step, prompts abort on end of input, completion |
 
 ## Roadmap
 - [ ] Review all code

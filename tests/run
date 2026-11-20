@@ -18,7 +18,8 @@ set -uo pipefail
 readonly HERE=$(cd "$(dirname "$0")" && pwd -P)
 readonly SUITES=(drift guard resolve sync ignore safety cli)
 
-command -v rclone >/dev/null || { printf 'tests: rclone not found\n' >&2; exit 1; }
+# Run it, not just find it: a version-manager shim can be on PATH yet fail.
+rclone version >/dev/null 2>&1 || { printf 'tests: rclone does not run (try: rclone version)\n' >&2; exit 1; }
 
 failed=0
 for suite in "${@:-${SUITES[@]}}"; do
