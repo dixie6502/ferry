@@ -34,6 +34,15 @@ never spell out both sides, and a rename recomputes everything beneath it for fr
 
 Requires `bash`, `git`, and `rclone` with a remote configured.
 
+Install by cloning the repo and running `symlink`, which links `ferry` into
+`~/bin` (it must be on your `PATH`) and `ferry-prompt.sh` to
+`~/.ferry-prompt.sh` (see [Prompt indicator](#prompt-indicator)):
+
+```sh
+git clone https://github.com/dixie6502/ferry.git
+cd ferry && ./symlink
+```
+
 Configure the remote once, in rclone itself:
 
 ```sh
@@ -42,8 +51,7 @@ rclone listremotes   # should print: Remote:
 ```
 
 Credentials live in rclone's own config (`~/.config/rclone/rclone.conf`); the
-`ferry` script holds none. Put `ferry` on your `PATH`, make it executable, then
-mark a directory as the root of a tree:
+`ferry` script holds none. Then mark a directory as the root of a tree:
 
 ```sh
 cd ~/Projects
@@ -373,13 +381,13 @@ from them. Scratch trees are built under `tmp/` and reset by each suite.
 | `sync` | both directions in one run, deletions restored (union), conflicts left in place and still resolvable, walks |
 | `ignore` | `.ferryignore` on both sides: unit and tree-root rules, anchoring, `sync` and `--mirror` safety, refused patterns, prompt agreement |
 
-## ToDo before going public
-- [x] Bash shell completion (`ferry completion bash`)
-- [x] Verbose flag and default phase output (`-v`/`--verbose`)
+## Roadmap
 - [ ] Review all code
-- [ ] Optional flag for the rclone remote with a global env variable for a
-  default (the remote is currently single-sourced from the root `.ferry`)
 - [ ] Clean Readme
 - [ ] Better the tree structure (graph) of root and unit. Use
   better terms, graph theory based if relevant
 - [ ] Find a nice ascii draw of a ferry!
+
+## License
+
+[MIT](LICENSE)
